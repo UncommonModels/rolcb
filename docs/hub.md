@@ -37,6 +37,28 @@ hubs into one virtual CAN segment.
 
 ## The `rolcb-hub` command
 
+Prebuilt binaries are attached to each [GitHub release](https://github.com/UncommonModels/rolcb/releases):
+
+| Download | Runs on |
+|---|---|
+| `rolcb-hub-…-x86_64-unknown-linux-musl.tar.gz` | Linux PCs (any distro) |
+| `rolcb-hub-…-aarch64-unknown-linux-musl.tar.gz` | Raspberry Pi 3/4/5 with 64-bit OS, other ARM64 Linux |
+| `rolcb-hub-…-armv7-unknown-linux-musleabihf.tar.gz` | Raspberry Pi with 32-bit Raspberry Pi OS |
+| `rolcb-hub-…-aarch64-apple-darwin.tar.gz` | Macs with Apple silicon |
+| `rolcb-hub-…-x86_64-apple-darwin.tar.gz` | Intel Macs |
+| `rolcb-hub-…-x86_64-pc-windows-msvc.zip` | Windows |
+
+The Linux builds are static, so they need nothing installed. Unpack and run:
+
+```sh
+tar xzf rolcb-hub-*-aarch64-unknown-linux-musl.tar.gz
+./rolcb-hub-*/rolcb-hub --serial /dev/ttyACM0
+```
+
+On macOS, clear the download quarantine first: `xattr -d com.apple.quarantine rolcb-hub`. `SHA256SUMS` lists the checksums.
+
+Or build it yourself (the binary is part of the `rolcb` crate, behind the `cli` feature):
+
 ```sh
 cargo install --path . --features cli,serial   # or: cargo install rolcb --features cli,serial
 ```

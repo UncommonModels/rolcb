@@ -36,6 +36,7 @@ static LOGGER: StderrLogger = StderrLogger;
 
 #[derive(Parser, Debug)]
 #[command(
+    name = "rolcb-hub",
     version,
     about = "OpenLCB GridConnect hub: relays CAN frames between TCP clients, other hubs and serial ports"
 )]
