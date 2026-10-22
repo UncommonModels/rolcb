@@ -25,7 +25,7 @@ fn acquire_drive_release() {
     node.start(0);
     node.poll(ALIAS_RESERVE_MS);
     let my_alias = node.alias().unwrap();
-    node.take_outgoing();
+    let _ = node.take_outgoing();
 
     // 1. Search for DCC 3.
     let ev = search::dcc_event(3, false, search::ALLOCATE);

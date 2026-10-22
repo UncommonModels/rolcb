@@ -3,7 +3,7 @@ Rustified OpenLCB library.
 
 `rolcb` is a sans-IO implementation of the [OpenLCB / LCC](https://openlcb.org) protocol stack for model railroads. You feed it CAN frames and the time. It gives back frames to send and decoded messages. Because of that it works the same from tokio, from WASM in a browser, or from `no_std` embedded code.
 
-It also includes **`rolcb-hub`**, a standalone GridConnect hub. It relays traffic between TCP clients (JMRI etc.), WebSocket clients (browser apps), other hubs and USB serial adapters.
+It also includes **`rolcb-hub`**, a standalone GridConnect hub. It relays traffic between TCP clients (JMRI, desktop apps), other hubs and USB serial adapters.
 
 ## Documentation
 
@@ -25,7 +25,7 @@ Build and view them locally:
 scripts/build-docs.sh --open        # or: cargo doc --no-deps --all-features --open
 ```
 
-The script uses nightly with `--cfg docsrs` (feature badges, as on docs.rs) if you have a nightly toolchain, and stable otherwise. Output goes to `target/doc/`.
+The script uses nightly with `--cfg docsrs` (feature badges, as on docs.rs) if you have a nightly toolchain, and stable otherwise. Output goes to `target/site/` (the crate pages sit at the site root, so URLs read `/rolcb/node/…`).
 
 ## Library
 
@@ -40,42 +40,58 @@ The script uses nightly with `--cfg docsrs` (feature badges, as on docs.rs) if y
 | `hub` *(feature `hub`)* | Async GridConnect hub built on tokio |
 
 ```rust
-use rolcb::{Node, NodeId, NodeInfo, EventId, EventState, Message, gridconnect};
+use rolcb::{gridconnect, EventId, EventState, Message, Node, NodeInfo};
+use std::io::Write;
 
-let mut node = Node::new("05.01.01.01.22.99".parse()?, NodeInfo::default());
-node.add_consumer("05.01.01.01.22.00.00.10".parse()?, EventState::Unknown);
-node.start(now_ms());                      // sends CID frames
-// ... every few ms:
-node.poll(now_ms());                       // RID/AMD/Init Complete after 200 ms
-for frame in node.take_outgoing() {
-    port.write_all(gridconnect::format(&frame).as_bytes())?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut now_ms = 0;              // any monotonic millisecond clock
+    let mut port: Vec<u8> = Vec::new(); // stands in for a serial port or TCP socket
+
+    let mut node = Node::new("05.01.01.01.22.99".parse()?, NodeInfo::default());
+    node.add_consumer("05.01.01.01.22.00.00.10".parse()?, EventState::Unknown);
+    node.start(now_ms);              // queues the CID frames
+    now_ms += 200;
+    node.poll(now_ms);               // RID/AMD/Init Complete once 200 ms have passed
+    for frame in node.take_outgoing() {
+        writeln!(port, "{}", gridconnect::format(&frame))?;
+    }
+
+    // For each frame read from the bus:
+    let frame = gridconnect::parse(":X195B4123N0501010122000010;")?;
+    if let Some(rx) = node.receive(&frame, now_ms) {
+        if let Message::Pcer(ev) = rx.msg {
+            println!("event {ev} happened");
+        }
+    }
+
+    node.send(Message::Pcer(EventId(0x0501_0101_2299_0100)));
+    for frame in node.take_outgoing() {
+        writeln!(port, "{frame}")?;  // CanFrame's Display is GridConnect too
+    }
+    Ok(())
 }
-// for each frame read from the bus:
-if let Some(rx) = node.receive(&frame, now_ms()) {
-    if let Message::Pcer(ev) = rx.msg { /* an event happened */ }
-}
-node.send(Message::Pcer(EventId(0x0501_0101_2200_0100)));
 ```
 
 Cargo features:
 
 - `std` (default). Turn it off for `no_std` + `alloc`.
 - `serde`: `NodeId`/`EventId` serialize as dotted hex strings.
-- `hub`: the async hub module (tokio, tokio-tungstenite).
+- `hub`: the async hub module (tokio).
 - `serial`: serial-port uplinks for the hub.
-- `cli`: the `rolcb-hub` binary.
+- `log`: hub connection and lag messages through the `log` crate (the library is silent without it).
+- `cli`: the `rolcb-hub` binary (`hub` alone does not build it).
 
 ## rolcb-hub
 
 ```sh
 cargo install --path . --features cli,serial
 
-rolcb-hub                                   # GridConnect TCP :12021 + WebSocket :12022
+rolcb-hub                                   # GridConnect TCP on :12021
 rolcb-hub --serial /dev/ttyACM0             # bridge a USB LCC buffer onto the network
 rolcb-hub --upstream jmri.local:12021 -v    # join another hub and print decoded traffic
 ```
 
-Every frame received on one port is sent to all other ports and never echoed back to its sender. Uplinks reconnect automatically. Each WebSocket text message may carry any number of GridConnect frames.
+Every frame received on one port is sent to all other ports and never echoed back to its sender. Uplinks reconnect automatically.
 
 ## Tools
 
@@ -86,8 +102,12 @@ cargo run --example gc_dump -- capture.txt   # decode a GridConnect log
 ## Testing
 
 ```sh
-cargo test --features cli,serial
+cargo test --all-features
+cargo test --no-default-features
+cargo clippy --all-targets --all-features -- -D warnings
 cargo build --no-default-features --target wasm32-unknown-unknown
 ```
+
+The minimum supported Rust version is 1.87. CI runs all of the above plus an MSRV build, `cargo fmt --check` and a warning-free `cargo doc`.
 
 MIT licensed.

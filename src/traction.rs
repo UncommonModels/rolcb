@@ -31,6 +31,21 @@
 //!    the train will stop itself.
 //! 5. **Release** with [`Command::ReleaseController`].
 //!
+//! # Controller handover
+//!
+//! When a second throttle sends Assign Controller to a train that already
+//! has a controller, the train asks the current controller first. It
+//! sends the *command* [`Command::ControllerChangingNotify`] (`20 04 flags
+//! NodeID`, carrying the new controller's Node ID) **to the current
+//! controller**, which answers with the *reply* [`Reply::ControllerChanged`]
+//! (`20 04 result`): result 0 accepts the handover, nonzero refuses it.
+//! So a throttle receives a Traction Control *Command* in this one case,
+//! even though it is not a train; [`Node`](crate::Node) delivers it
+//! instead of rejecting it. On accepting, the throttle should stop sending
+//! commands to that train and tell the user it lost control. The
+//! [throttle guide](crate::guide::throttle#losing-control-to-another-throttle)
+//! shows the exchange.
+//!
 //! # Command bytes
 //!
 //! | Byte 0 | Byte 1 | Meaning | Rest |
@@ -43,14 +58,15 @@
 //! | `0x20` | `0x01` | Assign Controller | flags, Node ID (6) |
 //! | `0x20` | `0x02` | Release Controller | flags, Node ID (6) |
 //! | `0x20` | `0x03` | Query Controller | |
-//! | `0x20` | `0x04` | Controller Changed notify | |
+//! | `0x20` | `0x04` | Controller Changing Notify (train → current controller) | flags, new controller Node ID (6) |
 //! | `0x30` | | Consist (listener) config | |
 //! | `0x40` | `0x01` | Management: Reserve | |
 //! | `0x40` | `0x02` | Management: Release | |
 //! | `0x40` | `0x03` | Management: Noop / heartbeat | |
 //!
 //! Replies reuse the same command bytes; see [`Reply`]. Constants are in
-//! [`cmd`].
+//! [`cmd`]. Bit 7 of byte 0 ([`cmd::LISTENER_FLAG`]) marks a command
+//! forwarded to a consist member and is ignored by [`Command::decode`].
 //!
 //! ```
 //! use rolcb::traction::{Command, Reply, Speed};
@@ -108,6 +124,7 @@ impl Speed {
 
     /// Build from a magnitude in scale m/s and a direction. The sign of `mps`
     /// is ignored; only `reverse` sets the direction.
+    #[must_use]
     pub fn from_mps(mps: f32, reverse: bool) -> Speed {
         let mut v = float16::from_f32(mps.abs());
         if reverse {
@@ -118,27 +135,43 @@ impl Speed {
 
     /// Build from a magnitude in scale miles per hour (1 mph = 0.44704 m/s)
     /// and a direction.
+    #[must_use]
     pub fn from_mph(mph: f32, reverse: bool) -> Speed {
         Self::from_mps(mph * MPS_PER_MPH, reverse)
     }
 
     /// True if the direction (sign) bit is set.
+    #[must_use]
     pub fn is_reverse(self) -> bool {
         self.0 & 0x8000 != 0
     }
 
     /// True for any half-float NaN, such as [`Speed::NAN`].
+    #[must_use]
     pub fn is_nan(self) -> bool {
         float16::to_f32(self.0).is_nan()
     }
 
-    /// Magnitude in m/s.
+    /// Magnitude in m/s (never negative; see [`Speed::is_reverse`]).
+    ///
+    /// For a NaN speed such as [`Speed::NAN`] ("not available") this
+    /// returns `f32::NAN`, so check [`Speed::is_nan`] before doing
+    /// arithmetic or comparisons with the result.
+    ///
+    /// ```
+    /// use rolcb::traction::Speed;
+    /// assert!(Speed::NAN.mps().is_nan());
+    /// assert_eq!(Speed::from_mps(2.0, true).mps(), 2.0);
+    /// ```
+    #[must_use]
     pub fn mps(self) -> f32 {
         float16::to_f32(self.0 & 0x7FFF)
     }
 
     /// Magnitude in mph. DCC command stations conventionally map mph 1:1
-    /// onto 128-step speed steps (126 = full).
+    /// onto 128-step speed steps (126 = full). NaN for a NaN speed, like
+    /// [`Speed::mps`].
+    #[must_use]
     pub fn mph(self) -> f32 {
         self.mps() / MPS_PER_MPH
     }
@@ -175,8 +208,10 @@ pub mod cmd {
     pub const CONTROLLER_RELEASE: u8 = 0x02;
     /// Controller Configuration sub-command: Query Controller.
     pub const CONTROLLER_QUERY: u8 = 0x03;
-    /// Controller Configuration sub-command: Controller Changed notification
-    /// (the train tells the old controller that another one took over).
+    /// Controller Configuration sub-command: Controller Changing Notify. As
+    /// a command the train sends it to its current controller when another
+    /// node asks to take over; as a reply the controller accepts (0) or
+    /// refuses the handover.
     pub const CONTROLLER_CHANGED: u8 = 0x04;
 
     /// Management sub-command: Reserve (lock the train for a multi-step operation).
@@ -206,7 +241,10 @@ pub mod cmd {
 /// assert_eq!(Command::Noop.encode(), [0x40, 0x03]);
 /// assert_eq!(Command::decode(&[0x7F]), Command::Unknown(vec![0x7F]));
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The enum is `#[non_exhaustive]`: match it with a `_` arm.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Command {
     /// Set speed and direction (`0x00`). Also clears an emergency stop.
     SetSpeed(Speed),
@@ -228,7 +266,7 @@ pub enum Command {
     },
     /// Become this train's controller (`0x20 0x01`). Answered by
     /// [`Reply::AssignController`]; if another throttle was in control, the
-    /// train may notify it with Controller Changed.
+    /// train first asks it with [`Command::ControllerChangingNotify`].
     AssignController {
         /// Flags byte (0 for a normal throttle).
         flags: u8,
@@ -244,6 +282,17 @@ pub enum Command {
     },
     /// Ask which node controls the train (`0x20 0x03`).
     QueryController,
+    /// Controller Changing Notify (`0x20 0x04 flags NodeID`), **train →
+    /// current controller**: another node (`new_controller`) asked to take
+    /// over. The controller answers with [`Reply::ControllerChanged`]
+    /// (result 0 = accept). This is the one command a throttle receives;
+    /// [`Node`](crate::Node) never auto-rejects it.
+    ControllerChangingNotify {
+        /// Flags byte (normally 0).
+        flags: u8,
+        /// The node that wants to become the controller.
+        new_controller: NodeId,
+    },
     /// Reserve the train for a multi-step operation (`0x40 0x01`).
     Reserve,
     /// Release a reservation (`0x40 0x02`).
@@ -261,19 +310,23 @@ fn addr24(addr: u32) -> [u8; 3] {
     [b[1], b[2], b[3]]
 }
 
-fn read24(p: &[u8], i: usize) -> u32 {
+fn read24(p: &[u8], i: usize) -> Option<u32> {
     match p.get(i..i + 3) {
-        Some(b) => ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32,
-        None => 0,
+        Some(&[a, b, c]) => Some(u32::from_be_bytes([0, a, b, c])),
+        _ => None,
     }
 }
 
 fn read16(p: &[u8], i: usize) -> Option<u16> {
-    p.get(i..i + 2).map(|b| u16::from_be_bytes([b[0], b[1]]))
+    match p.get(i..i + 2) {
+        Some(&[a, b]) => Some(u16::from_be_bytes([a, b])),
+        _ => None,
+    }
 }
 
 impl Command {
     /// Serialize to the command payload bytes.
+    #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         use cmd::*;
         let mut v = Vec::with_capacity(9);
@@ -302,6 +355,13 @@ impl Command {
                 v.extend_from_slice(&controller.to_bytes());
             }
             Command::QueryController => v.extend_from_slice(&[CONTROLLER_CONFIG, CONTROLLER_QUERY]),
+            Command::ControllerChangingNotify {
+                flags,
+                new_controller,
+            } => {
+                v.extend_from_slice(&[CONTROLLER_CONFIG, CONTROLLER_CHANGED, *flags]);
+                v.extend_from_slice(&new_controller.to_bytes());
+            }
             Command::Reserve => v.extend_from_slice(&[MANAGEMENT, MGMT_RESERVE]),
             Command::Release => v.extend_from_slice(&[MANAGEMENT, MGMT_RELEASE]),
             Command::Noop => v.extend_from_slice(&[MANAGEMENT, MGMT_NOOP]),
@@ -313,42 +373,68 @@ impl Command {
     /// Parse command payload bytes. Never fails; unknown or truncated
     /// commands become [`Command::Unknown`]. The consist
     /// [`LISTENER_FLAG`](cmd::LISTENER_FLAG) bit in byte 0 is ignored.
+    #[must_use]
     pub fn decode(p: &[u8]) -> Command {
         use cmd::*;
+        let unknown = || Command::Unknown(p.to_vec());
         let Some(&first) = p.first() else {
             return Command::Unknown(Vec::new());
         };
         let sub = p.get(1).copied().unwrap_or(0);
-        let node = || NodeId::from_bytes(p.get(3..).unwrap_or(&[])).ok();
+        // flags byte + Node ID, for the controller sub-commands.
+        let flags_node = || match p.get(2..) {
+            Some([flags, rest @ ..]) => NodeId::from_bytes(rest).ok().map(|n| (*flags, n)),
+            _ => None,
+        };
         match first & !LISTENER_FLAG {
-            SET_SPEED if p.len() >= 3 => Command::SetSpeed(Speed(read16(p, 1).unwrap())),
-            SET_FUNCTION if p.len() >= 6 => Command::SetFunction {
-                addr: read24(p, 1),
-                value: read16(p, 4).unwrap(),
+            SET_SPEED => read16(p, 1).map_or_else(unknown, |s| Command::SetSpeed(Speed(s))),
+            SET_FUNCTION => match (read24(p, 1), read16(p, 4)) {
+                (Some(addr), Some(value)) => Command::SetFunction { addr, value },
+                _ => unknown(),
             },
             EMERGENCY_STOP => Command::EmergencyStop,
             QUERY_SPEED => Command::QuerySpeed,
-            QUERY_FUNCTION if p.len() >= 4 => Command::QueryFunction { addr: read24(p, 1) },
-            CONTROLLER_CONFIG => match (sub, node()) {
-                (CONTROLLER_ASSIGN, Some(controller)) => Command::AssignController {
-                    flags: p[2],
-                    controller,
-                },
-                (CONTROLLER_RELEASE, Some(controller)) => Command::ReleaseController {
-                    flags: p[2],
-                    controller,
-                },
+            QUERY_FUNCTION => {
+                read24(p, 1).map_or_else(unknown, |addr| Command::QueryFunction { addr })
+            }
+            CONTROLLER_CONFIG => match (sub, flags_node()) {
+                (CONTROLLER_ASSIGN, Some((flags, controller))) => {
+                    Command::AssignController { flags, controller }
+                }
+                (CONTROLLER_RELEASE, Some((flags, controller))) => {
+                    Command::ReleaseController { flags, controller }
+                }
                 (CONTROLLER_QUERY, _) => Command::QueryController,
-                _ => Command::Unknown(p.to_vec()),
+                (CONTROLLER_CHANGED, Some((flags, new_controller))) => {
+                    Command::ControllerChangingNotify {
+                        flags,
+                        new_controller,
+                    }
+                }
+                _ => unknown(),
             },
             MANAGEMENT => match sub {
                 MGMT_RESERVE => Command::Reserve,
                 MGMT_RELEASE => Command::Release,
                 MGMT_NOOP => Command::Noop,
-                _ => Command::Unknown(p.to_vec()),
+                _ => unknown(),
             },
-            _ => Command::Unknown(p.to_vec()),
+            _ => unknown(),
         }
+    }
+
+    /// True if `payload` is a Controller Changing Notify command
+    /// (`20 04 …`), the one Traction Control Command a throttle receives.
+    /// Cheaper than a full [`Command::decode`].
+    ///
+    /// ```
+    /// use rolcb::traction::Command;
+    /// assert!(Command::is_controller_changing_notify(&[0x20, 0x04, 0, 5, 1, 1, 1, 0x22, 0x77]));
+    /// assert!(!Command::is_controller_changing_notify(&[0x20, 0x01]));
+    /// ```
+    #[must_use]
+    pub fn is_controller_changing_notify(payload: &[u8]) -> bool {
+        payload.starts_with(&[cmd::CONTROLLER_CONFIG, cmd::CONTROLLER_CHANGED])
     }
 }
 
@@ -371,7 +457,10 @@ impl Command {
 /// assert_eq!(Reply::decode(&r.encode()), r);
 /// assert_eq!(Reply::decode(&[0x20, 0x01, 0x00]), Reply::AssignController { result: 0 });
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The enum is `#[non_exhaustive]`: match it with a `_` arm.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Reply {
     /// Answer to [`Command::QuerySpeed`] (`0x10`).
     QuerySpeed {
@@ -408,10 +497,16 @@ pub enum Reply {
         /// The current controller; all-zero if none.
         controller: NodeId,
     },
-    /// Controller Changed (`0x20 0x04`): sent to a controller when another
-    /// node is taking over the train.
+    /// Answer to [`Command::ControllerChangingNotify`] (`0x20 0x04 result`),
+    /// sent **by the current controller back to the train**.
+    ///
+    /// Despite the name, a throttle does not receive this; it *sends* it
+    /// after the train asked whether another node may take over. Result 0
+    /// accepts the handover (the throttle should then consider the train
+    /// lost); nonzero refuses it, and the train refuses the new controller's
+    /// Assign Controller.
     ControllerChanged {
-        /// Result byte.
+        /// 0 = handover accepted; nonzero = refused.
         result: u8,
     },
     /// Answer to [`Command::Reserve`] (`0x40 0x01`).
@@ -433,6 +528,7 @@ pub enum Reply {
 
 impl Reply {
     /// Serialize to the reply payload bytes.
+    #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         use cmd::*;
         let mut v = Vec::with_capacity(9);
@@ -473,26 +569,31 @@ impl Reply {
         v
     }
 
-    /// Parse reply payload bytes. Never fails; unknown replies become
-    /// [`Reply::Unknown`]. Missing optional fields of a Query Speed reply
-    /// decode as [`Speed::NAN`].
+    /// Parse reply payload bytes. Never fails; unknown or truncated replies
+    /// become [`Reply::Unknown`]. Missing optional fields of a Query Speed
+    /// reply decode as [`Speed::NAN`]; a missing result byte decodes as 0.
+    #[must_use]
     pub fn decode(p: &[u8]) -> Reply {
         use cmd::*;
+        let unknown = || Reply::Unknown(p.to_vec());
         let Some(&first) = p.first() else {
             return Reply::Unknown(Vec::new());
         };
         let sub = p.get(1).copied().unwrap_or(0);
         let byte = |i: usize| p.get(i).copied().unwrap_or(0);
         match first {
-            QUERY_SPEED if p.len() >= 3 => Reply::QuerySpeed {
-                set_speed: Speed(read16(p, 1).unwrap()),
-                estop: byte(3) & 1 != 0,
-                commanded: read16(p, 4).map(Speed).unwrap_or(Speed::NAN),
-                actual: read16(p, 6).map(Speed).unwrap_or(Speed::NAN),
+            QUERY_SPEED => match read16(p, 1) {
+                Some(set) => Reply::QuerySpeed {
+                    set_speed: Speed(set),
+                    estop: byte(3) & 1 != 0,
+                    commanded: read16(p, 4).map_or(Speed::NAN, Speed),
+                    actual: read16(p, 6).map_or(Speed::NAN, Speed),
+                },
+                None => unknown(),
             },
-            QUERY_FUNCTION if p.len() >= 6 => Reply::QueryFunction {
-                addr: read24(p, 1),
-                value: read16(p, 4).unwrap(),
+            QUERY_FUNCTION => match (read24(p, 1), read16(p, 4)) {
+                (Some(addr), Some(value)) => Reply::QueryFunction { addr, value },
+                _ => unknown(),
             },
             CONTROLLER_CONFIG => match sub {
                 CONTROLLER_ASSIGN => Reply::AssignController { result: byte(2) },
@@ -501,14 +602,14 @@ impl Reply {
                     controller: NodeId::from_bytes(p.get(3..).unwrap_or(&[])).unwrap_or_default(),
                 },
                 CONTROLLER_CHANGED => Reply::ControllerChanged { result: byte(2) },
-                _ => Reply::Unknown(p.to_vec()),
+                _ => unknown(),
             },
             MANAGEMENT => match sub {
                 MGMT_RESERVE => Reply::Reserve { result: byte(2) },
                 MGMT_NOOP => Reply::Heartbeat { timeout_s: byte(2) },
-                _ => Reply::Unknown(p.to_vec()),
+                _ => unknown(),
             },
-            _ => Reply::Unknown(p.to_vec()),
+            _ => unknown(),
         }
     }
 }
@@ -578,6 +679,7 @@ pub mod search {
     /// Sets [`EXACT`] | [`ADDRESS_ONLY`] | [`DCC`], plus
     /// [`DCC_LONG_ADDRESS`] when needed, plus `extra_flags` (typically
     /// [`ALLOCATE`] and/or a speed-step value).
+    #[must_use]
     pub fn dcc_event(address: u16, long: bool, extra_flags: u8) -> EventId {
         let mut flags = EXACT | ADDRESS_ONLY | DCC | extra_flags;
         if long || address > 127 {
@@ -598,6 +700,7 @@ pub mod search {
     /// let e = search::query_event(42, 0);
     /// assert_eq!(e.0, 0x0900_99FF_FFFF_4200);
     /// ```
+    #[must_use]
     pub fn query_event(number: u32, flags: u8) -> EventId {
         let mut nibbles: u32 = 0xFF_FFFF;
         let mut n = number.min(999_999);
@@ -615,6 +718,7 @@ pub mod search {
     }
 
     /// True if `e` lies in the train search event range ([`PREFIX`]).
+    #[must_use]
     pub fn is_search_event(e: EventId) -> bool {
         e.0 >> 32 == PREFIX
     }
@@ -622,6 +726,7 @@ pub mod search {
     /// Decode a search event into (number, flags). Non-digit nibbles are skipped.
     ///
     /// Returns `None` if `e` is not a search event.
+    #[must_use]
     pub fn decode(e: EventId) -> Option<(u32, u8)> {
         if !is_search_event(e) {
             return None;
@@ -649,6 +754,7 @@ pub mod search {
 /// let headlight_on = Command::SetFunction { addr: 0, value: function_value(true) };
 /// assert_eq!(headlight_on.encode(), [0x01, 0, 0, 0, 0, 1]);
 /// ```
+#[must_use]
 pub fn function_value(on: bool) -> u16 {
     on as u16
 }
@@ -696,6 +802,10 @@ mod tests {
                 controller: me,
             },
             Command::QueryController,
+            Command::ControllerChangingNotify {
+                flags: 0,
+                new_controller: me,
+            },
             Command::Reserve,
             Command::Release,
             Command::Noop,
@@ -750,5 +860,144 @@ mod tests {
         assert_eq!(e.0 & 0xFF, 0xEC);
         assert!(search::is_search_event(e));
         assert!(!search::is_search_event(EventId::IS_TRAIN));
+    }
+
+    #[test]
+    fn controller_changing_notify_round_trip() {
+        let new = NodeId::new(0x0501_0101_2277);
+        let c = Command::ControllerChangingNotify {
+            flags: 0,
+            new_controller: new,
+        };
+        let bytes = c.encode();
+        assert_eq!(
+            bytes,
+            vec![0x20, 0x04, 0x00, 0x05, 0x01, 0x01, 0x01, 0x22, 0x77]
+        );
+        assert!(Command::is_controller_changing_notify(&bytes));
+        assert_eq!(Command::decode(&bytes), c);
+        // The controller's answer is a reply with the same sub-command.
+        let r = Reply::ControllerChanged { result: 0 };
+        assert_eq!(r.encode(), vec![0x20, 0x04, 0x00]);
+        assert_eq!(Reply::decode(&r.encode()), r);
+        assert_eq!(
+            Reply::decode(&[0x20, 0x04, 0x01]),
+            Reply::ControllerChanged { result: 1 }
+        );
+        // Through the message layer: 9 bytes, two frames.
+        let m = crate::Message::TractionCommand {
+            dest: 0x285,
+            payload: bytes,
+        };
+        let mut asm = crate::message::Assembler::new();
+        let raw = m
+            .to_frames(0x6A1)
+            .iter()
+            .find_map(|f| asm.accept(f))
+            .unwrap();
+        assert_eq!(crate::Message::from(raw), m);
+    }
+
+    #[test]
+    fn truncated_payloads_are_unknown() {
+        for p in [
+            &[0x00][..],
+            &[0x00, 0x3C],
+            &[0x01, 0, 0, 3, 0],
+            &[0x11, 0, 0],
+            &[0x20, 0x01, 0x00, 5, 1, 1, 1, 0x22],
+            &[0x20, 0x02],
+            &[0x20, 0x04, 0x00],
+            &[0x20, 0x09],
+            &[0x40, 0x07],
+            &[0x30, 0x01],
+        ] {
+            assert_eq!(Command::decode(p), Command::Unknown(p.to_vec()), "{p:02X?}");
+            // Unknown commands re-encode to the same bytes.
+            assert_eq!(Command::decode(p).encode(), p);
+        }
+        assert_eq!(Command::decode(&[]), Command::Unknown(vec![]));
+        for p in [
+            &[0x10, 0x3C][..],
+            &[0x11, 0, 0, 1, 0],
+            &[0x20, 0x09],
+            &[0x77],
+        ] {
+            assert_eq!(Reply::decode(p), Reply::Unknown(p.to_vec()), "{p:02X?}");
+        }
+        assert_eq!(Reply::decode(&[]), Reply::Unknown(vec![]));
+        // Optional Query Speed fields default to NaN; result bytes to 0.
+        assert_eq!(
+            Reply::decode(&[0x10, 0x3C, 0x00]),
+            Reply::QuerySpeed {
+                set_speed: Speed(0x3C00),
+                estop: false,
+                commanded: Speed::NAN,
+                actual: Speed::NAN
+            }
+        );
+        assert_eq!(
+            Reply::decode(&[0x20, 0x01]),
+            Reply::AssignController { result: 0 }
+        );
+        assert_eq!(
+            Reply::decode(&[0x20, 0x03, 0x00, 1, 2]),
+            Reply::QueryController {
+                flags: 0,
+                controller: NodeId::default()
+            }
+        );
+    }
+
+    #[test]
+    fn listener_flag_is_ignored() {
+        assert_eq!(
+            Command::decode(&[0x80, 0x3C, 0x00]),
+            Command::SetSpeed(Speed(0x3C00))
+        );
+        assert_eq!(
+            Command::decode(&[0x81, 0, 0, 2, 0, 1]),
+            Command::SetFunction { addr: 2, value: 1 }
+        );
+        assert_eq!(Command::decode(&[0x82]), Command::EmergencyStop);
+        assert_eq!(Command::decode(&[0xC0, 0x03]), Command::Noop);
+    }
+
+    #[test]
+    fn query_event_clamps_and_decodes() {
+        assert_eq!(search::query_event(0, 0).0, 0x0900_99FF_FFFF_F000);
+        assert_eq!(search::query_event(999_999, 0).0, 0x0900_99FF_9999_9900);
+        assert_eq!(
+            search::query_event(1_000_000, 0x12),
+            search::query_event(999_999, 0x12)
+        );
+        assert_eq!(
+            search::query_event(u32::MAX, 0),
+            search::query_event(999_999, 0)
+        );
+        assert_eq!(
+            search::decode(search::query_event(4_294, 0x08)),
+            Some((4_294, 0x08))
+        );
+        assert_eq!(search::decode(EventId::IS_TRAIN), None);
+        assert_eq!(
+            search::dcc_event(9_999, false, 0).0 & 0xFF,
+            (search::EXACT | search::ADDRESS_ONLY | search::DCC | search::DCC_LONG_ADDRESS) as u64
+        );
+    }
+
+    #[test]
+    fn speed_nan_and_hash() {
+        assert!(Speed::NAN.is_nan());
+        assert!(Speed::NAN.mps().is_nan());
+        assert!(Speed::NAN.mph().is_nan());
+        assert!(!Speed::STOP_REVERSE.is_nan());
+        assert_eq!(Speed::from_mps(-3.0, false), Speed::from_mps(3.0, false));
+        let mut set = alloc::collections::BTreeSet::new();
+        set.insert(alloc::format!("{:?}", Command::Noop));
+        assert_eq!(set.len(), 1);
+        fn hashable<T: core::hash::Hash>(_: &T) {}
+        hashable(&Command::Noop);
+        hashable(&Reply::Heartbeat { timeout_s: 1 });
     }
 }

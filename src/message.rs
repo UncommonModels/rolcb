@@ -6,12 +6,13 @@
 //! This module converts between messages and CAN frames, following the
 //! *CAN Frame Transfer Standard*:
 //!
-//! * [`Message::to_frames`] encodes a message sent from a given source
-//!   alias into one or more [`CanFrame`]s.
+//! * [`Message::try_to_frames`] encodes a message sent from a given source
+//!   alias into one or more [`CanFrame`]s, rejecting messages that cannot
+//!   be represented on CAN; [`Message::to_frames`] is the lenient variant.
 //! * [`Assembler`] collects incoming frames, reassembles multi-frame
 //!   messages, and yields [`RawMessage`]s.
-//! * [`Message::from_parts`] decodes a `RawMessage` (MTI, destination,
-//!   payload) into a `Message`.
+//! * [`Message::from_parts`] (or `Message::from(raw)`) decodes a
+//!   `RawMessage` (MTI, destination, payload) into a `Message`.
 //!
 //! [`Node`](crate::Node) wires these together (and resolves aliases into
 //! Node IDs for [`Received`]), but they are usable on their own, for
@@ -70,7 +71,7 @@
 //! let mut asm = Assembler::new();
 //! let raw = frames.iter().find_map(|f| asm.accept(f)).unwrap();
 //! assert_eq!(raw.src_alias, 0x123);
-//! assert_eq!(Message::from_parts(raw.mti, raw.dest, raw.payload), reply);
+//! assert_eq!(Message::from(raw), reply);
 //! ```
 
 use alloc::collections::BTreeMap;
@@ -161,7 +162,12 @@ pub mod protocol {
 /// let q = Message::SnipRequest { dest: 0x6A1 };
 /// assert_eq!(q.dest(), Some(0x6A1));
 /// ```
+///
+/// The enum is `#[non_exhaustive]` so that new MTIs can get dedicated
+/// variants without a breaking release: match it with a `_` arm (which also
+/// covers [`Message::Other`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Message {
     /// Initialization Complete (MTI `0x0100`/`0x0101`). The last step of a
     /// node's login; announces it is ready to communicate.
@@ -311,7 +317,8 @@ pub enum Message {
     Datagram {
         /// Destination alias.
         dest: u16,
-        /// Datagram contents (the encoder does not enforce the 72-byte limit).
+        /// Datagram contents, at most 72 bytes ([`MAX_DATAGRAM`]). Enforced
+        /// by [`Message::try_to_frames`], not by [`Message::to_frames`].
         data: Vec<u8>,
     },
     /// Datagram Received OK (MTI `0x0A28`).
@@ -362,19 +369,89 @@ pub struct Received {
     pub msg: Message,
 }
 
-fn event_of(p: &[u8]) -> EventId {
-    EventId::from_bytes(p).unwrap_or_default()
-}
-
 fn u16_at(p: &[u8], i: usize) -> u16 {
     match p.get(i..i + 2) {
-        Some(b) => u16::from_be_bytes([b[0], b[1]]),
-        None => 0,
+        Some(&[a, b]) => u16::from_be_bytes([a, b]),
+        _ => 0,
     }
 }
 
+/// The largest datagram the *Datagram Transport Standard* allows (72 bytes).
+pub const MAX_DATAGRAM: usize = 72;
+
+/// Why [`Message::try_to_frames`] refused to encode a message.
+///
+/// ```
+/// use rolcb::{EncodeError, Message, Mti};
+///
+/// let big = Message::Datagram { dest: 0x456, data: vec![0; 73] };
+/// assert_eq!(big.try_to_frames(0x123), Err(EncodeError::DatagramTooLong { len: 73 }));
+///
+/// let no_dest = Message::Other { mti: Mti(0x0DA8), dest: None, payload: vec![] };
+/// assert_eq!(
+///     no_dest.try_to_frames(0x123),
+///     Err(EncodeError::MissingDestination { mti: Mti(0x0DA8) })
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum EncodeError {
+    /// A global message's payload is longer than one CAN frame (8 bytes).
+    GlobalPayloadTooLong {
+        /// The payload length.
+        len: usize,
+    },
+    /// The MTI is addressed (bit 3 set) but the message has no destination.
+    MissingDestination {
+        /// The MTI.
+        mti: Mti,
+    },
+    /// The MTI is global but the message carries a destination.
+    UnexpectedDestination {
+        /// The MTI.
+        mti: Mti,
+    },
+    /// The MTI has bits above bit 11 set and is not [`Mti::DATAGRAM`], so it
+    /// does not fit the 12-bit CAN-MTI field (e.g. stream MTIs, which need
+    /// stream frames this crate does not build).
+    MtiTooWide {
+        /// The MTI.
+        mti: Mti,
+    },
+    /// A datagram is longer than [`MAX_DATAGRAM`] (72) bytes.
+    DatagramTooLong {
+        /// The payload length.
+        len: usize,
+    },
+}
+
+impl core::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            EncodeError::GlobalPayloadTooLong { len } => {
+                write!(f, "global message payload of {len} bytes exceeds 8")
+            }
+            EncodeError::MissingDestination { mti } => {
+                write!(f, "addressed MTI {mti} without a destination")
+            }
+            EncodeError::UnexpectedDestination { mti } => {
+                write!(f, "global MTI {mti} with a destination")
+            }
+            EncodeError::MtiTooWide { mti } => {
+                write!(f, "MTI {mti} does not fit the 12-bit CAN-MTI")
+            }
+            EncodeError::DatagramTooLong { len } => {
+                write!(f, "datagram of {len} bytes exceeds {MAX_DATAGRAM}")
+            }
+        }
+    }
+}
+
+impl core::error::Error for EncodeError {}
+
 impl Message {
     /// The MTI this message is sent with.
+    #[must_use]
     pub fn mti(&self) -> Mti {
         use Message::*;
         match self {
@@ -418,6 +495,7 @@ impl Message {
     }
 
     /// Destination alias for addressed messages; `None` for global ones.
+    #[must_use]
     pub fn dest(&self) -> Option<u16> {
         use Message::*;
         match self {
@@ -444,6 +522,7 @@ impl Message {
     /// This is the byte sequence defined by the relevant standard: a Node
     /// ID, an Event ID, error code + MTI, and so on. The Protocol Support
     /// Reply is padded to six bytes.
+    #[must_use]
     pub fn payload(&self) -> Vec<u8> {
         use Message::*;
         match self {
@@ -489,7 +568,8 @@ impl Message {
     /// [`Message::payload`]. It never fails: unknown MTIs and payloads too
     /// short for their MTI become [`Message::Other`]. `dest` should be
     /// `Some` for addressed MTIs (a missing destination decodes as alias 0).
-    /// Usually fed from a [`RawMessage`] produced by an [`Assembler`].
+    /// Usually fed from a [`RawMessage`] produced by an [`Assembler`]; the
+    /// `From<RawMessage>` impl does exactly that.
     ///
     /// ```
     /// use rolcb::{EventId, Message, Mti};
@@ -501,95 +581,92 @@ impl Message {
     /// let m = Message::from_parts(Mti::PCER, None, vec![1, 2]);
     /// assert!(matches!(m, Message::Other { .. }));
     /// ```
+    #[must_use]
     pub fn from_parts(mti: Mti, dest: Option<u16>, p: Vec<u8>) -> Message {
         use Message::*;
         let d = dest.unwrap_or(0);
-        let nid = |p: &[u8]| NodeId::from_bytes(p).ok();
-        let has_event = p.len() >= 8;
-        match mti {
-            Mti::INITIALIZATION_COMPLETE | Mti::INITIALIZATION_COMPLETE_SIMPLE if p.len() >= 6 => {
-                InitializationComplete {
-                    node_id: nid(&p).unwrap(),
-                    simple: mti.0 & 1 == 1,
-                }
+        let node = NodeId::from_bytes(&p).ok();
+        let event = EventId::from_bytes(&p).ok();
+        let simple = mti.0 & 1 == 1;
+        match (mti, node, event) {
+            (
+                Mti::INITIALIZATION_COMPLETE | Mti::INITIALIZATION_COMPLETE_SIMPLE,
+                Some(node_id),
+                _,
+            ) => InitializationComplete { node_id, simple },
+            (Mti::VERIFY_NODE_ID_GLOBAL, node_id, _) => VerifyNodeIdGlobal { node_id },
+            (Mti::VERIFY_NODE_ID_ADDRESSED, node_id, _) => {
+                VerifyNodeIdAddressed { dest: d, node_id }
             }
-            Mti::VERIFY_NODE_ID_GLOBAL => VerifyNodeIdGlobal { node_id: nid(&p) },
-            Mti::VERIFY_NODE_ID_ADDRESSED => VerifyNodeIdAddressed {
-                dest: d,
-                node_id: nid(&p),
-            },
-            Mti::VERIFIED_NODE_ID | Mti::VERIFIED_NODE_ID_SIMPLE if p.len() >= 6 => {
-                VerifiedNodeId {
-                    node_id: nid(&p).unwrap(),
-                    simple: mti.0 & 1 == 1,
-                }
+            (Mti::VERIFIED_NODE_ID | Mti::VERIFIED_NODE_ID_SIMPLE, Some(node_id), _) => {
+                VerifiedNodeId { node_id, simple }
             }
-            Mti::OPTIONAL_INTERACTION_REJECTED => OptionalInteractionRejected {
+            (Mti::OPTIONAL_INTERACTION_REJECTED, ..) => OptionalInteractionRejected {
                 dest: d,
                 code: u16_at(&p, 0),
                 mti: Mti(u16_at(&p, 2)),
             },
-            Mti::TERMINATE_DUE_TO_ERROR => TerminateDueToError {
+            (Mti::TERMINATE_DUE_TO_ERROR, ..) => TerminateDueToError {
                 dest: d,
                 code: u16_at(&p, 0),
                 mti: Mti(u16_at(&p, 2)),
             },
-            Mti::PROTOCOL_SUPPORT_INQUIRY => ProtocolSupportInquiry { dest: d },
-            Mti::PROTOCOL_SUPPORT_REPLY => {
-                let b = |i: usize| *p.get(i).unwrap_or(&0) as u32;
+            (Mti::PROTOCOL_SUPPORT_INQUIRY, ..) => ProtocolSupportInquiry { dest: d },
+            (Mti::PROTOCOL_SUPPORT_REPLY, ..) => {
+                let b = |i: usize| p.get(i).copied().unwrap_or(0) as u32;
                 ProtocolSupportReply {
                     dest: d,
                     flags: (b(0) << 16) | (b(1) << 8) | b(2),
                 }
             }
-            Mti::IDENTIFY_CONSUMER if has_event => IdentifyConsumer(event_of(&p)),
-            Mti::CONSUMER_IDENTIFIED_VALID if has_event => ConsumerIdentified {
-                event: event_of(&p),
+            (Mti::IDENTIFY_CONSUMER, _, Some(e)) => IdentifyConsumer(e),
+            (Mti::CONSUMER_IDENTIFIED_VALID, _, Some(event)) => ConsumerIdentified {
+                event,
                 state: EventState::Valid,
             },
-            Mti::CONSUMER_IDENTIFIED_INVALID if has_event => ConsumerIdentified {
-                event: event_of(&p),
+            (Mti::CONSUMER_IDENTIFIED_INVALID, _, Some(event)) => ConsumerIdentified {
+                event,
                 state: EventState::Invalid,
             },
-            Mti::CONSUMER_IDENTIFIED_UNKNOWN if has_event => ConsumerIdentified {
-                event: event_of(&p),
+            (Mti::CONSUMER_IDENTIFIED_UNKNOWN, _, Some(event)) => ConsumerIdentified {
+                event,
                 state: EventState::Unknown,
             },
-            Mti::CONSUMER_RANGE_IDENTIFIED if has_event => ConsumerRangeIdentified(event_of(&p)),
-            Mti::IDENTIFY_PRODUCER if has_event => IdentifyProducer(event_of(&p)),
-            Mti::PRODUCER_IDENTIFIED_VALID if has_event => ProducerIdentified {
-                event: event_of(&p),
+            (Mti::CONSUMER_RANGE_IDENTIFIED, _, Some(e)) => ConsumerRangeIdentified(e),
+            (Mti::IDENTIFY_PRODUCER, _, Some(e)) => IdentifyProducer(e),
+            (Mti::PRODUCER_IDENTIFIED_VALID, _, Some(event)) => ProducerIdentified {
+                event,
                 state: EventState::Valid,
             },
-            Mti::PRODUCER_IDENTIFIED_INVALID if has_event => ProducerIdentified {
-                event: event_of(&p),
+            (Mti::PRODUCER_IDENTIFIED_INVALID, _, Some(event)) => ProducerIdentified {
+                event,
                 state: EventState::Invalid,
             },
-            Mti::PRODUCER_IDENTIFIED_UNKNOWN if has_event => ProducerIdentified {
-                event: event_of(&p),
+            (Mti::PRODUCER_IDENTIFIED_UNKNOWN, _, Some(event)) => ProducerIdentified {
+                event,
                 state: EventState::Unknown,
             },
-            Mti::PRODUCER_RANGE_IDENTIFIED if has_event => ProducerRangeIdentified(event_of(&p)),
-            Mti::IDENTIFY_EVENTS_GLOBAL => IdentifyEventsGlobal,
-            Mti::IDENTIFY_EVENTS_ADDRESSED => IdentifyEventsAddressed { dest: d },
-            Mti::LEARN_EVENT if has_event => LearnEvent(event_of(&p)),
-            Mti::PCER if has_event => Pcer(event_of(&p)),
-            Mti::TRACTION_CONTROL_COMMAND => TractionCommand {
+            (Mti::PRODUCER_RANGE_IDENTIFIED, _, Some(e)) => ProducerRangeIdentified(e),
+            (Mti::IDENTIFY_EVENTS_GLOBAL, ..) => IdentifyEventsGlobal,
+            (Mti::IDENTIFY_EVENTS_ADDRESSED, ..) => IdentifyEventsAddressed { dest: d },
+            (Mti::LEARN_EVENT, _, Some(e)) => LearnEvent(e),
+            (Mti::PCER, _, Some(e)) => Pcer(e),
+            (Mti::TRACTION_CONTROL_COMMAND, ..) => TractionCommand {
                 dest: d,
                 payload: p,
             },
-            Mti::TRACTION_CONTROL_REPLY => TractionReply {
+            (Mti::TRACTION_CONTROL_REPLY, ..) => TractionReply {
                 dest: d,
                 payload: p,
             },
-            Mti::SNIP_REQUEST => SnipRequest { dest: d },
-            Mti::SNIP_REPLY => SnipReply { dest: d, data: p },
-            Mti::DATAGRAM => Datagram { dest: d, data: p },
-            Mti::DATAGRAM_RECEIVED_OK => DatagramReceivedOk {
+            (Mti::SNIP_REQUEST, ..) => SnipRequest { dest: d },
+            (Mti::SNIP_REPLY, ..) => SnipReply { dest: d, data: p },
+            (Mti::DATAGRAM, ..) => Datagram { dest: d, data: p },
+            (Mti::DATAGRAM_RECEIVED_OK, ..) => DatagramReceivedOk {
                 dest: d,
-                flags: *p.first().unwrap_or(&0),
+                flags: p.first().copied().unwrap_or(0),
             },
-            Mti::DATAGRAM_REJECTED => DatagramRejected {
+            (Mti::DATAGRAM_REJECTED, ..) => DatagramRejected {
                 dest: d,
                 code: u16_at(&p, 0),
             },
@@ -601,6 +678,65 @@ impl Message {
         }
     }
 
+    /// Check that this message can be represented on CAN.
+    fn check(&self, payload_len: usize) -> Result<(), EncodeError> {
+        let mti = self.mti();
+        let dest = self.dest();
+        if mti == Mti::DATAGRAM {
+            if dest.is_none() {
+                return Err(EncodeError::MissingDestination { mti });
+            }
+            if payload_len > MAX_DATAGRAM {
+                return Err(EncodeError::DatagramTooLong { len: payload_len });
+            }
+            return Ok(());
+        }
+        if mti.0 > 0x0FFF {
+            return Err(EncodeError::MtiTooWide { mti });
+        }
+        match (mti.is_addressed(), dest) {
+            (true, None) => Err(EncodeError::MissingDestination { mti }),
+            (false, Some(_)) => Err(EncodeError::UnexpectedDestination { mti }),
+            (false, None) if payload_len > 8 => {
+                Err(EncodeError::GlobalPayloadTooLong { len: payload_len })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Encode as one or more CAN frames sent from `src_alias`, rejecting
+    /// messages that cannot be represented faithfully.
+    ///
+    /// Framing is the same as [`Message::to_frames`]. The checks are:
+    ///
+    /// | Problem | Error |
+    /// |---|---|
+    /// | global message with more than 8 payload bytes | [`EncodeError::GlobalPayloadTooLong`] |
+    /// | addressed MTI with no `dest` ([`Message::Other`] only) | [`EncodeError::MissingDestination`] |
+    /// | global MTI with a `dest` ([`Message::Other`] only) | [`EncodeError::UnexpectedDestination`] |
+    /// | MTI with bit 12 or higher set, other than [`Mti::DATAGRAM`] | [`EncodeError::MtiTooWide`] |
+    /// | datagram over 72 bytes | [`EncodeError::DatagramTooLong`] |
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`EncodeError`] from the table above.
+    ///
+    /// ```
+    /// use rolcb::{EncodeError, Message, Mti};
+    ///
+    /// let ok = Message::Datagram { dest: 0x456, data: vec![0x20; 72] };
+    /// assert_eq!(ok.try_to_frames(0x123)?.len(), 9);
+    ///
+    /// let wide = Message::Other { mti: Mti(0x1F88), dest: Some(0x456), payload: vec![] };
+    /// assert!(matches!(wide.try_to_frames(0x123), Err(EncodeError::MtiTooWide { .. })));
+    /// # Ok::<(), EncodeError>(())
+    /// ```
+    pub fn try_to_frames(&self, src_alias: u16) -> Result<Vec<CanFrame>, EncodeError> {
+        let payload = self.payload();
+        self.check(payload.len())?;
+        Ok(self.frames_from(src_alias, &payload))
+    }
+
     /// Encode as one or more CAN frames sent from `src_alias`.
     ///
     /// * Global messages produce one frame (payload truncated to 8 bytes).
@@ -609,6 +745,19 @@ impl Message {
     ///   described in the [module docs](self#global-addressed-and-datagram-framing).
     /// * Datagrams produce one frame per 8 bytes using the datagram frame
     ///   types.
+    ///
+    /// This encoder is lenient and never fails. For a message that
+    /// [`Message::try_to_frames`] would reject it keeps its historical
+    /// behaviour: global payloads are truncated to 8 bytes, an addressed MTI
+    /// without a destination is sent as if it were global, a destination on
+    /// a global MTI is sent as addressed framing, bits 12-15 of the MTI are
+    /// dropped, and datagrams over 72 bytes are split into as many frames as
+    /// needed. In debug builds such a message trips a `debug_assert!`; use
+    /// `try_to_frames` when the message comes from untrusted input.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds only, if `try_to_frames` would return an error.
     ///
     /// ```
     /// use rolcb::{gridconnect, Message, NodeId};
@@ -622,20 +771,35 @@ impl Message {
     /// let ids: Vec<u32> = d.to_frames(0x123).iter().map(|f| f.id).collect();
     /// assert_eq!(ids, [0x1B45_6123, 0x1C45_6123, 0x1D45_6123]);
     /// ```
+    #[must_use]
     pub fn to_frames(&self, src_alias: u16) -> Vec<CanFrame> {
-        let mti = self.mti();
         let payload = self.payload();
-        let mut out = Vec::new();
+        debug_assert!(
+            self.check(payload.len()).is_ok(),
+            "Message::to_frames: {:?} for {:?}; use try_to_frames",
+            self.check(payload.len()),
+            self
+        );
+        self.frames_from(src_alias, &payload)
+    }
+
+    /// The lenient encoder behind [`Message::to_frames`], without the debug
+    /// assertion. Used by [`Node`](crate::Node).
+    pub(crate) fn to_frames_lenient(&self, src_alias: u16) -> Vec<CanFrame> {
+        self.frames_from(src_alias, &self.payload())
+    }
+
+    fn frames_from(&self, src_alias: u16, payload: &[u8]) -> Vec<CanFrame> {
+        let mti = self.mti();
 
         if mti == Mti::DATAGRAM {
             let dest = self.dest().unwrap_or(0);
-            let chunks: Vec<&[u8]> = if payload.is_empty() {
-                alloc::vec![&[][..]]
-            } else {
-                payload.chunks(8).collect()
-            };
-            let n = chunks.len();
-            for (i, c) in chunks.into_iter().enumerate() {
+            let n = payload.len().div_ceil(8).max(1);
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let chunk = payload
+                    .get(i * 8..payload.len().min(i * 8 + 8))
+                    .unwrap_or(&[]);
                 let kind = match (n, i) {
                     (1, _) => MessageFrameType::DatagramOnly,
                     (_, 0) => MessageFrameType::DatagramFirst,
@@ -648,7 +812,7 @@ impl Message {
                     alias: src_alias,
                 }
                 .encode();
-                out.push(CanFrame::of(id, c));
+                out.push(CanFrame::of(id, chunk));
             }
             return out;
         }
@@ -661,16 +825,15 @@ impl Message {
         match self.dest() {
             None => {
                 let n = payload.len().min(8);
-                out.push(CanFrame::of(id, &payload[..n]));
+                alloc::vec![CanFrame::of(id, &payload[..n])]
             }
             Some(dest) => {
-                let chunks: Vec<&[u8]> = if payload.is_empty() {
-                    alloc::vec![&[][..]]
-                } else {
-                    payload.chunks(6).collect()
-                };
-                let n = chunks.len();
-                for (i, c) in chunks.into_iter().enumerate() {
+                let n = payload.len().div_ceil(6).max(1);
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    let chunk = payload
+                        .get(i * 6..payload.len().min(i * 6 + 6))
+                        .unwrap_or(&[]);
                     let flags: u8 = match (n, i) {
                         (1, _) => 0x00,
                         (_, 0) => 0x10,
@@ -680,19 +843,19 @@ impl Message {
                     let mut d = [0u8; 8];
                     d[0] = flags | ((dest >> 8) as u8 & 0x0F);
                     d[1] = dest as u8;
-                    d[2..2 + c.len()].copy_from_slice(c);
-                    out.push(CanFrame::of(id, &d[..2 + c.len()]));
+                    d[2..2 + chunk.len()].copy_from_slice(chunk);
+                    out.push(CanFrame::of(id, &d[..2 + chunk.len()]));
                 }
+                out
             }
         }
-        out
     }
 }
 
 /// A complete message reassembled from frames, before decoding.
 ///
-/// Turn it into a [`Message`] with
-/// `Message::from_parts(raw.mti, raw.dest, raw.payload)`.
+/// Turn it into a [`Message`] with `Message::from(raw)` (or
+/// `Message::from_parts(raw.mti, raw.dest, raw.payload)`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawMessage {
     /// Source alias from the CAN header.
@@ -705,21 +868,63 @@ pub struct RawMessage {
     pub payload: Vec<u8>,
 }
 
+impl From<RawMessage> for Message {
+    /// Decode with [`Message::from_parts`]. The source alias is dropped.
+    fn from(raw: RawMessage) -> Message {
+        Message::from_parts(raw.mti, raw.dest, raw.payload)
+    }
+}
+
 const MAX_PARTIALS: usize = 32;
 const MAX_PAYLOAD: usize = 256;
 
+/// How long [`Assembler::accept_at`] keeps a partial multi-frame message
+/// that receives no further frames (3 s).
+pub const PARTIAL_TIMEOUT_MS: u64 = 3_000;
+
+type PartialKey = (u16, u16, u16);
+
+#[derive(Debug)]
+struct Partial {
+    data: Vec<u8>,
+    /// Time of the last frame added (`accept_at` clock).
+    last_ms: u64,
+    /// Insertion order, for evicting the oldest entry.
+    seq: u64,
+    /// Started by a legacy "only"-flagged SNIP reply frame.
+    legacy_snip: bool,
+}
+
 /// Reassembles multi-frame addressed messages and datagrams.
 ///
-/// Feed every frame to [`Assembler::accept`]. Single-frame messages come
-/// straight back; multi-frame ones are buffered until their last frame.
-/// Partial messages are keyed by (source alias, destination alias, MTI), so
-/// interleaved transfers from different nodes are handled.
+/// Feed every frame to [`Assembler::accept_at`] (or [`Assembler::accept`]).
+/// Single-frame messages come straight back; multi-frame ones are buffered
+/// until their last frame. Partial messages are keyed by (source alias,
+/// destination alias, MTI), so interleaved transfers from different nodes
+/// are handled.
 ///
-/// The assembler is defensive about memory: at most 32 partial messages are
-/// kept (the oldest-keyed one is dropped to make room) and a partial message
-/// that would exceed 256 bytes is discarded. A middle or last frame with no
-/// matching first frame is ignored. It is a passive listener, so it
-/// reassembles messages for *every* destination, not just one node.
+/// The assembler is defensive about memory:
+///
+/// * at most 32 partial messages are kept; when a new one starts at the
+///   cap, the one that *started* longest ago is dropped;
+/// * a partial message that would exceed 256 bytes is discarded;
+/// * with [`accept_at`](Assembler::accept_at), a partial message that gets
+///   no new frame for [`PARTIAL_TIMEOUT_MS`] (3 s) is dropped. Plain
+///   [`accept`](Assembler::accept) has no clock and never expires anything.
+///
+/// A middle or last frame with no matching first frame is ignored. It is a
+/// passive listener, so it reassembles messages for *every* destination,
+/// not just one node.
+///
+/// # Legacy SNIP replies
+///
+/// Some early nodes send a multi-frame SNIP reply with every frame flagged
+/// "only" (`0x0_`) instead of first/middle/last. A complete SNIP payload
+/// never fits in one addressed frame (it has at least eight bytes), so the
+/// assembler concatenates "only" SNIP reply frames from the same source to
+/// the same destination until the payload holds six NUL terminators, then
+/// returns it. A truncated reply of that kind is held until it expires or
+/// is evicted rather than returned early.
 ///
 /// ```
 /// use rolcb::message::{Assembler, Message};
@@ -735,25 +940,59 @@ const MAX_PAYLOAD: usize = 256;
 /// assert_eq!(frames.len(), 2); // 9 bytes → 6 + 3
 ///
 /// let mut asm = Assembler::new();
-/// assert!(asm.accept(&frames[0]).is_none());
-/// let raw = asm.accept(&frames[1]).expect("complete");
+/// assert!(asm.accept_at(&frames[0], 1_000).is_none());
+/// let raw = asm.accept_at(&frames[1], 1_010).expect("complete");
 /// assert_eq!(raw.dest, Some(0x6A1));
-/// assert_eq!(Message::from_parts(raw.mti, raw.dest, raw.payload), cmd);
+/// assert_eq!(Message::from(raw), cmd);
+///
+/// // A first frame whose continuation never arrives is forgotten after 3 s.
+/// assert!(asm.accept_at(&frames[0], 2_000).is_none());
+/// assert!(asm.accept_at(&frames[1], 5_000).is_none());
 /// ```
 #[derive(Debug, Default)]
 pub struct Assembler {
-    partial: BTreeMap<(u16, u16, u16), Vec<u8>>,
+    partial: BTreeMap<PartialKey, Partial>,
+    next_seq: u64,
+    now_ms: u64,
 }
 
 impl Assembler {
     /// An assembler with no partial messages.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Accept one frame. Returns a message when one is complete. Control
-    /// frames (CID/RID/AMD...) return `None`; the node handles those.
+    /// Accept one frame without a clock. Returns a message when one is
+    /// complete. Control frames (CID/RID/AMD...) return `None`; the node
+    /// handles those.
+    ///
+    /// Partial messages accepted this way **never expire**; they leave only
+    /// when completed, evicted at the cap, or [`forget`](Assembler::forget)
+    /// is called. Prefer [`Assembler::accept_at`] in long-running programs.
+    #[must_use]
     pub fn accept(&mut self, frame: &CanFrame) -> Option<RawMessage> {
+        self.accept_inner(frame)
+    }
+
+    /// Accept one frame received at `now_ms` (any monotonic millisecond
+    /// clock). Like [`Assembler::accept`], but first drops partial messages
+    /// that have had no new frame for [`PARTIAL_TIMEOUT_MS`].
+    #[must_use]
+    pub fn accept_at(&mut self, frame: &CanFrame, now_ms: u64) -> Option<RawMessage> {
+        self.now_ms = now_ms;
+        self.partial
+            .retain(|_, p| now_ms.saturating_sub(p.last_ms) < PARTIAL_TIMEOUT_MS);
+        self.accept_inner(frame)
+    }
+
+    /// Number of partial messages currently buffered.
+    #[must_use]
+    pub fn partial_count(&self) -> usize {
+        self.partial.len()
+    }
+
+    fn accept_inner(&mut self, frame: &CanFrame) -> Option<RawMessage> {
         let data = frame.data();
         match frame.header() {
             CanHeader::Message { mti, alias } => {
@@ -765,19 +1004,20 @@ impl Assembler {
                         payload: data.to_vec(),
                     });
                 }
-                if data.len() < 2 {
+                let [b0, b1, body @ ..] = data else {
                     return None;
-                }
-                let dest = (((data[0] & 0x0F) as u16) << 8) | data[1] as u16;
-                let flags = data[0] & 0x30;
-                let body = &data[2..];
+                };
+                let dest = (((b0 & 0x0F) as u16) << 8) | *b1 as u16;
+                let flags = b0 & 0x30;
                 let key = (alias, dest, mti.0);
-                self.collect(key, flags, body).map(|payload| RawMessage {
-                    src_alias: alias,
-                    mti,
-                    dest: Some(dest),
-                    payload,
-                })
+                let legacy = mti == Mti::SNIP_REPLY;
+                self.collect(key, flags, body, legacy)
+                    .map(|payload| RawMessage {
+                        src_alias: alias,
+                        mti,
+                        dest: Some(dest),
+                        payload,
+                    })
             }
             CanHeader::Datagram { kind, dest, alias } => {
                 let flags = match kind {
@@ -787,47 +1027,90 @@ impl Assembler {
                     _ => 0x30,
                 };
                 let key = (alias, dest, Mti::DATAGRAM.0);
-                self.collect(key, flags, data).map(|payload| RawMessage {
-                    src_alias: alias,
-                    mti: Mti::DATAGRAM,
-                    dest: Some(dest),
-                    payload,
-                })
+                self.collect(key, flags, data, false)
+                    .map(|payload| RawMessage {
+                        src_alias: alias,
+                        mti: Mti::DATAGRAM,
+                        dest: Some(dest),
+                        payload,
+                    })
             }
             _ => None,
         }
     }
 
-    fn collect(&mut self, key: (u16, u16, u16), flags: u8, body: &[u8]) -> Option<Vec<u8>> {
+    fn insert(&mut self, key: PartialKey, data: Vec<u8>, legacy_snip: bool) {
+        if self.partial.len() >= MAX_PARTIALS && !self.partial.contains_key(&key) {
+            // Drop the entry that started longest ago to bound memory.
+            let oldest = self
+                .partial
+                .iter()
+                .min_by_key(|(_, p)| p.seq)
+                .map(|(k, _)| *k);
+            if let Some(k) = oldest {
+                self.partial.remove(&k);
+            }
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.partial.insert(
+            key,
+            Partial {
+                data,
+                last_ms: self.now_ms,
+                seq,
+                legacy_snip,
+            },
+        );
+    }
+
+    fn collect(&mut self, key: PartialKey, flags: u8, body: &[u8], snip: bool) -> Option<Vec<u8>> {
         match flags {
+            0x00 if snip => {
+                // Legacy SNIP: "only" frames concatenated until 6 NULs.
+                let mut buf = match self.partial.remove(&key) {
+                    Some(p) if p.legacy_snip => p.data,
+                    _ => Vec::new(),
+                };
+                buf.extend_from_slice(body);
+                if buf.iter().filter(|&&b| b == 0).count() >= 6 {
+                    return Some(buf);
+                }
+                if buf.len() <= MAX_PAYLOAD {
+                    self.insert(key, buf, true);
+                }
+                None
+            }
             0x00 => {
                 self.partial.remove(&key);
                 Some(body.to_vec())
             }
             0x10 => {
-                if self.partial.len() >= MAX_PARTIALS && !self.partial.contains_key(&key) {
-                    // Drop the oldest-keyed entry to bound memory.
-                    let first = *self.partial.keys().next().unwrap();
-                    self.partial.remove(&first);
-                }
-                self.partial.insert(key, body.to_vec());
+                self.insert(key, body.to_vec(), false);
                 None
             }
             0x30 => {
-                if let Some(buf) = self.partial.get_mut(&key) {
-                    if buf.len() + body.len() <= MAX_PAYLOAD {
-                        buf.extend_from_slice(body);
-                    } else {
+                let now = self.now_ms;
+                match self.partial.get_mut(&key) {
+                    Some(p) if !p.legacy_snip && p.data.len() + body.len() <= MAX_PAYLOAD => {
+                        p.data.extend_from_slice(body);
+                        p.last_ms = now;
+                    }
+                    Some(p) if !p.legacy_snip => {
                         self.partial.remove(&key);
                     }
+                    _ => {}
                 }
                 None
             }
-            _ => {
-                let mut buf = self.partial.remove(&key)?;
-                buf.extend_from_slice(body);
-                Some(buf)
-            }
+            _ => match self.partial.remove(&key) {
+                Some(p) if !p.legacy_snip => {
+                    let mut buf = p.data;
+                    buf.extend_from_slice(body);
+                    Some(buf)
+                }
+                _ => None,
+            },
         }
     }
 
@@ -988,5 +1271,431 @@ mod tests {
         assert!(a.accept(&f2[0]).is_none());
         assert_eq!(a.accept(&f2[1]).unwrap().payload, vec![2; 10]);
         assert_eq!(a.accept(&f1[1]).unwrap().payload, vec![1; 10]);
+    }
+
+    fn round_trip(m: &Message) -> Message {
+        let frames = m.try_to_frames(0x321).expect("encodable");
+        assert_eq!(frames, m.to_frames(0x321));
+        let mut a = Assembler::new();
+        let mut raws: Vec<_> = frames.iter().filter_map(|f| a.accept_at(f, 5)).collect();
+        assert_eq!(raws.len(), 1, "{m:?} gave {raws:?}");
+        assert_eq!(a.partial_count(), 0);
+        let raw = raws.remove(0);
+        assert_eq!(raw.src_alias, 0x321);
+        assert_eq!(raw.mti, m.mti());
+        assert_eq!(raw.dest, m.dest());
+        Message::from(raw)
+    }
+
+    #[test]
+    fn every_variant_round_trips() {
+        let n = NodeId::new(0x0501_0101_2200);
+        let e = EventId(0x0102_0304_0506_0708);
+        let snip = crate::NodeInfo {
+            manufacturer: "Uncommon Models".into(),
+            model: "Panel".into(),
+            ..Default::default()
+        }
+        .snip_payload();
+        let mut all = vec![
+            Message::InitializationComplete {
+                node_id: n,
+                simple: false,
+            },
+            Message::InitializationComplete {
+                node_id: n,
+                simple: true,
+            },
+            Message::VerifyNodeIdGlobal { node_id: None },
+            Message::VerifyNodeIdGlobal { node_id: Some(n) },
+            Message::VerifyNodeIdAddressed {
+                dest: 0x777,
+                node_id: None,
+            },
+            Message::VerifyNodeIdAddressed {
+                dest: 0x777,
+                node_id: Some(n),
+            },
+            Message::VerifiedNodeId {
+                node_id: n,
+                simple: false,
+            },
+            Message::VerifiedNodeId {
+                node_id: n,
+                simple: true,
+            },
+            Message::OptionalInteractionRejected {
+                dest: 0xFFF,
+                code: 0x1043,
+                mti: Mti::DATAGRAM,
+            },
+            Message::TerminateDueToError {
+                dest: 0x001,
+                code: 0x2041,
+                mti: Mti::SNIP_REPLY,
+            },
+            Message::ProtocolSupportInquiry { dest: 0x777 },
+            Message::ProtocolSupportReply {
+                dest: 0x777,
+                flags: 0xFF_FFFF,
+            },
+            Message::IdentifyConsumer(e),
+            Message::ConsumerRangeIdentified(e),
+            Message::IdentifyProducer(e),
+            Message::ProducerRangeIdentified(e),
+            Message::IdentifyEventsGlobal,
+            Message::IdentifyEventsAddressed { dest: 0x777 },
+            Message::LearnEvent(e),
+            Message::Pcer(e),
+            Message::TractionCommand {
+                dest: 0x6A1,
+                payload: vec![],
+            },
+            Message::TractionCommand {
+                dest: 0x6A1,
+                payload: (0..9).collect(),
+            },
+            Message::TractionReply {
+                dest: 0x6A1,
+                payload: (0..12).collect(),
+            },
+            Message::TractionReply {
+                dest: 0x6A1,
+                payload: (0..13).collect(),
+            },
+            Message::SnipRequest { dest: 0x777 },
+            Message::SnipReply {
+                dest: 0x777,
+                data: snip,
+            },
+            Message::DatagramReceivedOk {
+                dest: 0x777,
+                flags: 0x80,
+            },
+            Message::DatagramRejected {
+                dest: 0x777,
+                code: 0x2020,
+            },
+            Message::Other {
+                mti: Mti(0x0DA8),
+                dest: Some(0x777),
+                payload: vec![1, 2, 3, 4, 5, 6, 7],
+            },
+            Message::Other {
+                mti: Mti(0x0DA0),
+                dest: None,
+                payload: vec![9; 8],
+            },
+        ];
+        for state in [EventState::Valid, EventState::Invalid, EventState::Unknown] {
+            all.push(Message::ConsumerIdentified { event: e, state });
+            all.push(Message::ProducerIdentified { event: e, state });
+        }
+        for len in [0usize, 1, 7, 8, 9, 16, 17, 64, 71, 72] {
+            all.push(Message::Datagram {
+                dest: 0x456,
+                data: (0..len as u8).collect(),
+            });
+        }
+        for m in &all {
+            assert_eq!(&round_trip(m), m);
+        }
+    }
+
+    #[test]
+    fn datagram_frame_counts() {
+        for (len, frames, kinds) in [
+            (0usize, 1usize, &[2u32][..]),
+            (8, 1, &[2]),
+            (9, 2, &[3, 5]),
+            (17, 3, &[3, 4, 5]),
+            (72, 9, &[3, 4, 4, 4, 4, 4, 4, 4, 5]),
+        ] {
+            let m = Message::Datagram {
+                dest: 0x456,
+                data: vec![0xAA; len],
+            };
+            let f = m.try_to_frames(0x123).unwrap();
+            assert_eq!(f.len(), frames, "{len}");
+            let got: Vec<u32> = f.iter().map(|f| (f.id >> 24) & 7).collect();
+            assert_eq!(got, kinds, "{len}");
+            assert_eq!(f.iter().map(|f| f.data().len()).sum::<usize>(), len);
+        }
+    }
+
+    #[test]
+    fn try_to_frames_rejects() {
+        let e = |m: Message| m.try_to_frames(0x123).unwrap_err();
+        assert_eq!(
+            e(Message::Other {
+                mti: Mti(0x0DA0),
+                dest: None,
+                payload: vec![0; 9]
+            }),
+            EncodeError::GlobalPayloadTooLong { len: 9 }
+        );
+        assert_eq!(
+            e(Message::Other {
+                mti: Mti(0x0DA8),
+                dest: None,
+                payload: vec![]
+            }),
+            EncodeError::MissingDestination { mti: Mti(0x0DA8) }
+        );
+        assert_eq!(
+            e(Message::Other {
+                mti: Mti::DATAGRAM,
+                dest: None,
+                payload: vec![]
+            }),
+            EncodeError::MissingDestination { mti: Mti::DATAGRAM }
+        );
+        assert_eq!(
+            e(Message::Other {
+                mti: Mti::PCER,
+                dest: Some(1),
+                payload: vec![0; 8]
+            }),
+            EncodeError::UnexpectedDestination { mti: Mti::PCER }
+        );
+        assert_eq!(
+            e(Message::Other {
+                mti: Mti(0x1F88),
+                dest: Some(1),
+                payload: vec![]
+            }),
+            EncodeError::MtiTooWide { mti: Mti(0x1F88) }
+        );
+        assert_eq!(
+            e(Message::Datagram {
+                dest: 1,
+                data: vec![0; 73]
+            }),
+            EncodeError::DatagramTooLong { len: 73 }
+        );
+        // Lenient encoder keeps its old behaviour (without the debug assertion).
+        let big = Message::Datagram {
+            dest: 1,
+            data: vec![0; 80],
+        };
+        assert_eq!(big.to_frames_lenient(0x123).len(), 10);
+        let wide = Message::Other {
+            mti: Mti(0x1F88),
+            dest: None,
+            payload: vec![],
+        };
+        assert_eq!(
+            wide.to_frames_lenient(0x123)[0].header(),
+            CanHeader::Message {
+                mti: Mti(0x0F88),
+                alias: 0x123
+            }
+        );
+        assert!(
+            !alloc::string::ToString::to_string(&EncodeError::DatagramTooLong { len: 73 })
+                .is_empty()
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "use try_to_frames")]
+    fn to_frames_debug_asserts() {
+        let _ = Message::Datagram {
+            dest: 1,
+            data: vec![0; 73],
+        }
+        .to_frames(0x123);
+    }
+
+    #[test]
+    fn orphan_middle_and_final_frames_are_ignored() {
+        let m = Message::TractionReply {
+            dest: 0x100,
+            payload: (0..20).collect(),
+        };
+        let f = m.to_frames(0x201);
+        assert_eq!(f.len(), 4);
+        let mut a = Assembler::new();
+        assert!(a.accept(&f[1]).is_none());
+        assert!(a.accept(&f[3]).is_none());
+        assert_eq!(a.partial_count(), 0);
+        // Datagram middle/final without a first frame too.
+        let d = Message::Datagram {
+            dest: 0x100,
+            data: vec![1; 20],
+        }
+        .to_frames(0x201);
+        assert!(a.accept(&d[1]).is_none());
+        assert!(a.accept(&d[2]).is_none());
+        assert_eq!(a.partial_count(), 0);
+        // A frame too short to hold the destination is ignored.
+        let short = CanFrame::of(
+            CanHeader::Message {
+                mti: Mti::TRACTION_CONTROL_REPLY,
+                alias: 0x201,
+            }
+            .encode(),
+            &[0x01],
+        );
+        assert!(a.accept(&short).is_none());
+        // A new first frame restarts the message.
+        assert!(a.accept(&f[0]).is_none());
+        assert!(a.accept(&f[0]).is_none());
+        assert!(a.accept(&f[1]).is_none());
+        assert!(a.accept(&f[2]).is_none());
+        assert_eq!(Message::from(a.accept(&f[3]).unwrap()), m);
+    }
+
+    #[test]
+    fn partials_expire_with_accept_at() {
+        let m = Message::TractionReply {
+            dest: 0x100,
+            payload: vec![7; 10],
+        };
+        let f = m.to_frames(0x201);
+        let mut a = Assembler::new();
+        assert!(a.accept_at(&f[0], 0).is_none());
+        assert_eq!(a.partial_count(), 1);
+        // Still alive just before the timeout…
+        assert!(a
+            .accept_at(
+                &Message::Pcer(EventId(1)).to_frames(0x300)[0],
+                PARTIAL_TIMEOUT_MS - 1
+            )
+            .is_some());
+        assert_eq!(a.partial_count(), 1);
+        // …and gone at it.
+        assert!(a.accept_at(&f[1], PARTIAL_TIMEOUT_MS).is_none());
+        assert_eq!(a.partial_count(), 0);
+
+        // Middle frames keep a long message alive.
+        let long = Message::TractionReply {
+            dest: 0x100,
+            payload: vec![7; 20],
+        };
+        let f = long.to_frames(0x201);
+        assert!(a.accept_at(&f[0], 10_000).is_none());
+        assert!(a.accept_at(&f[1], 12_000).is_none());
+        assert!(a.accept_at(&f[2], 14_000).is_none());
+        assert_eq!(Message::from(a.accept_at(&f[3], 16_000).unwrap()), long);
+
+        // Plain accept never expires.
+        let mut a = Assembler::new();
+        assert!(a.accept(&f[0]).is_none());
+        assert!(a.accept(&f[1]).is_none());
+        assert!(a.accept(&f[2]).is_none());
+        assert!(a.accept(&f[3]).is_some());
+    }
+
+    #[test]
+    fn eviction_drops_the_oldest_partial() {
+        let mut a = Assembler::new();
+        // Start partials from high aliases down, so the oldest has the
+        // *largest* key: eviction must follow age, not key order.
+        let first_frame = |alias: u16| {
+            Message::TractionReply {
+                dest: 0x100,
+                payload: vec![alias as u8; 10],
+            }
+            .to_frames(alias)
+        };
+        let mut frames = Vec::new();
+        for i in 0..MAX_PARTIALS as u16 {
+            let f = first_frame(0x800 - i);
+            assert!(a.accept_at(&f[0], u64::from(i)).is_none());
+            frames.push(f);
+        }
+        assert_eq!(a.partial_count(), MAX_PARTIALS);
+        let extra = first_frame(0x001);
+        assert!(a.accept_at(&extra[0], 100).is_none());
+        assert_eq!(a.partial_count(), MAX_PARTIALS);
+        // The oldest (alias 0x800) was evicted; the next oldest survives.
+        assert!(a.accept_at(&frames[0][1], 101).is_none());
+        assert!(a.accept_at(&frames[1][1], 102).is_some());
+        assert!(a.accept_at(&extra[1], 103).is_some());
+    }
+
+    #[test]
+    fn oversized_partials_are_dropped() {
+        let mut a = Assembler::new();
+        let big = Message::TractionReply {
+            dest: 0x100,
+            payload: vec![1; MAX_PAYLOAD + 12],
+        };
+        let got: Vec<_> = big
+            .to_frames(0x201)
+            .iter()
+            .filter_map(|f| a.accept(f))
+            .collect();
+        assert!(got.is_empty());
+        assert_eq!(a.partial_count(), 0);
+    }
+
+    #[test]
+    fn forget_drops_partials_from_alias() {
+        let mut a = Assembler::new();
+        let f = Message::TractionReply {
+            dest: 0x100,
+            payload: vec![1; 10],
+        }
+        .to_frames(0x201);
+        assert!(a.accept(&f[0]).is_none());
+        a.forget(0x201);
+        assert!(a.accept(&f[1]).is_none());
+    }
+
+    #[test]
+    fn legacy_snip_only_frames_are_joined() {
+        let info = crate::NodeInfo {
+            manufacturer: "Old Co".into(),
+            model: "Relic".into(),
+            hardware_version: "1".into(),
+            software_version: "2".into(),
+            user_name: "Yard".into(),
+            user_description: "East end".into(),
+        };
+        let payload = info.snip_payload();
+        let id = CanHeader::Message {
+            mti: Mti::SNIP_REPLY,
+            alias: 0x0AB,
+        }
+        .encode();
+        let mut a = Assembler::new();
+        let mut out = None;
+        for chunk in payload.chunks(6) {
+            let mut d = vec![0x01, 0x23]; // flag 0 ("only"), dest 0x123
+            d.extend_from_slice(chunk);
+            assert!(out.is_none(), "completed early");
+            out = a.accept_at(&CanFrame::of(id, &d), 0);
+        }
+        let raw = out.expect("joined");
+        assert_eq!(raw.dest, Some(0x123));
+        assert_eq!(raw.payload, payload);
+        assert_eq!(crate::NodeInfo::from_snip(&raw.payload), info);
+        assert_eq!(a.partial_count(), 0);
+
+        // A properly framed reply still works, and a stray legacy partial is
+        // replaced by a real first frame.
+        let _ = a.accept_at(&CanFrame::of(id, &[0x01, 0x23, 4, b'X', 0]), 10);
+        assert_eq!(a.partial_count(), 1);
+        let modern = Message::SnipReply {
+            dest: 0x123,
+            data: payload.clone(),
+        };
+        let got: Vec<_> = modern
+            .to_frames(0x0AB)
+            .iter()
+            .filter_map(|f| a.accept_at(f, 11))
+            .collect();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].payload, payload);
+        // An incomplete legacy reply expires.
+        let _ = a.accept_at(&CanFrame::of(id, &[0x01, 0x23, 4, b'X', 0]), 20);
+        let _ = a.accept_at(
+            &Message::Pcer(EventId(1)).to_frames(1)[0],
+            20 + PARTIAL_TIMEOUT_MS,
+        );
+        assert_eq!(a.partial_count(), 0);
     }
 }

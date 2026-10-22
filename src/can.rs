@@ -81,7 +81,9 @@ use crate::ParseError;
 /// exchange between this crate and your I/O layer. Convert to and from
 /// GridConnect text with [`gridconnect`](crate::gridconnect), or map to a
 /// SocketCAN / embedded CAN driver frame using [`CanFrame::id`] and
-/// [`CanFrame::data`]. `Debug` prints `CanFrame(19490ABC [01 02])`.
+/// [`CanFrame::data`]. `Debug` prints `CanFrame(19490ABC [01 02])`;
+/// `Display` and `FromStr` use GridConnect text (`:X19490ABCN0102;`, see
+/// [`gridconnect`](crate::gridconnect)).
 ///
 /// ```
 /// use rolcb::CanFrame;
@@ -90,6 +92,9 @@ use crate::ParseError;
 /// assert_eq!(f.data().len(), 8);
 /// assert_eq!(f.src_alias(), 0x123);
 /// assert!(CanFrame::new(0x195B_4123, &[0; 9]).is_err());
+///
+/// assert_eq!(f.to_string(), ":X195B4123N0501010122000010;");
+/// assert_eq!(":X195B4123N0501010122000010;".parse::<CanFrame>()?, f);
 /// # Ok::<(), rolcb::ParseError>(())
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -120,26 +125,55 @@ impl CanFrame {
         })
     }
 
-    /// Like [`CanFrame::new`] but panics on more than 8 bytes. For internal use
-    /// where lengths are guaranteed by construction.
+    /// Like [`CanFrame::new`] for internal use where lengths are guaranteed
+    /// by construction. Bytes past the eighth are dropped (and trip a
+    /// `debug_assert!`).
     pub(crate) fn of(id: u32, data: &[u8]) -> Self {
-        Self::new(id, data).expect("CAN payload over 8 bytes")
+        debug_assert!(data.len() <= 8, "CAN payload over 8 bytes");
+        let n = data.len().min(8);
+        let mut d = [0u8; 8];
+        d[..n].copy_from_slice(&data[..n]);
+        CanFrame {
+            id: id & 0x1FFF_FFFF,
+            len: n as u8,
+            data: d,
+        }
     }
 
     /// The data bytes (0 to 8).
+    #[must_use]
     pub fn data(&self) -> &[u8] {
         &self.data[..self.len as usize]
     }
 
     /// Decode the identifier into its OpenLCB meaning.
+    #[must_use]
     pub fn header(&self) -> CanHeader {
         CanHeader::decode(self.id)
     }
 
     /// The 12-bit source alias (bits 11-0 of the identifier). Present in
     /// every OpenLCB frame, control or message.
+    #[must_use]
     pub fn src_alias(&self) -> u16 {
         (self.id & 0xFFF) as u16
+    }
+}
+
+impl core::fmt::Display for CanFrame {
+    /// GridConnect text, e.g. `:X19490ABCN0102;` (no newline). Same as
+    /// [`gridconnect::format`](crate::gridconnect::format).
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        crate::gridconnect::write(self, f)
+    }
+}
+
+impl core::str::FromStr for CanFrame {
+    type Err = ParseError;
+
+    /// Parse GridConnect text, as [`gridconnect::parse`](crate::gridconnect::parse).
+    fn from_str(s: &str) -> Result<Self, ParseError> {
+        crate::gridconnect::parse(s)
     }
 }
 
@@ -178,7 +212,7 @@ impl core::fmt::Debug for CanFrame {
 /// In this crate only the datagram kinds appear inside
 /// [`CanHeader::Datagram`]; global/addressed and stream frames have their
 /// own [`CanHeader`] variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MessageFrameType {
     /// Global or addressed message; the variable field holds the CAN-MTI.
     GlobalAddressed,
@@ -225,7 +259,10 @@ pub enum MessageFrameType {
 /// assert_eq!(CanHeader::decode(0x195B_4123), h);
 /// assert_eq!(CanHeader::Rid { alias: 0x285 }.encode(), 0x1070_0285);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The enum is `#[non_exhaustive]`: match it with a `_` arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CanHeader {
     /// Check ID frame. `seq` is 7..=4; `node_id_bits` is the 12-bit chunk of
     /// the Node ID being reserved (7 = bits 47-36 ... 4 = bits 11-0).
@@ -325,6 +362,7 @@ impl CanHeader {
     /// Interpret a 29-bit identifier. Never fails: unrecognised values map to
     /// [`OtherControl`](CanHeader::OtherControl) or
     /// [`Reserved`](CanHeader::Reserved). Bit 28 is not checked.
+    #[must_use]
     pub fn decode(id: u32) -> CanHeader {
         let alias = (id & 0xFFF) as u16;
         let var = ((id >> 12) & 0xFFF) as u16;
@@ -385,10 +423,17 @@ impl CanHeader {
     /// Build the 29-bit identifier (with the reserved bit 28 set).
     ///
     /// A [`Datagram`](CanHeader::Datagram) whose `kind` is not one of the
-    /// four datagram variants is encoded as `DatagramOnly`.
+    /// four datagram variants is encoded as `DatagramOnly`. Every field is
+    /// masked to its width (3 bits for `seq`/`kind`, 12 bits for aliases and
+    /// the variable field), so an out-of-range value can never spill into a
+    /// neighbouring field.
+    #[must_use]
     pub fn encode(&self) -> u32 {
         let ctl = |seq: u32, var: u16, alias: u16| {
-            RESERVED_BIT | (seq << 24) | ((var as u32 & 0xFFF) << 12) | (alias as u32 & 0xFFF)
+            RESERVED_BIT
+                | ((seq & 0x7) << 24)
+                | ((var as u32 & 0xFFF) << 12)
+                | (alias as u32 & 0xFFF)
         };
         let msg = |kind: u32, var: u16, alias: u16| ctl(kind, var, alias) | MESSAGE_BIT;
         match *self {
@@ -419,6 +464,7 @@ impl CanHeader {
     }
 
     /// The source alias, whatever the frame type.
+    #[must_use]
     pub fn src_alias(&self) -> u16 {
         match *self {
             CanHeader::Cid { alias, .. }
@@ -451,6 +497,7 @@ impl CanHeader {
 /// assert!(f.iter().all(|f| f.data().is_empty()));
 /// assert!(matches!(f[1].header(), CanHeader::Cid { seq: 6, node_id_bits: 0x101, alias: 0x285 }));
 /// ```
+#[must_use]
 pub fn cid_frames(node: NodeId, alias: u16) -> [CanFrame; 4] {
     let n = node.as_u64();
     let chunk = |seq: u8| {
@@ -528,5 +575,61 @@ mod tests {
         };
         assert_eq!(h.encode(), 0x1A45_6123);
         assert_eq!(CanHeader::decode(0x1A45_6123), h);
+    }
+
+    /// `encode(decode(id)) == id` for identifiers with bit 28 set, sampled
+    /// across the whole 29-bit space (plus every control/frame-type corner).
+    #[test]
+    fn header_sweep() {
+        let check = |id: u32| {
+            let id = id | RESERVED_BIT;
+            let h = CanHeader::decode(id);
+            assert_eq!(h.encode(), id, "{id:08X} -> {h:?}");
+            assert_eq!(h.src_alias() as u32, id & 0xFFF);
+        };
+        let mut id = 0u32;
+        while id < 0x1000_0000 {
+            check(id);
+            id += 0x0000_1F3D; // odd stride, hits every alias/var nibble pattern
+        }
+        for kind in 0..8u32 {
+            for var in [0x000, 0x700, 0x701, 0x702, 0x703, 0x704, 0xFFF] {
+                for msg in [0, MESSAGE_BIT] {
+                    check(msg | (kind << 24) | (var << 12) | 0xABC);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encode_masks_fields() {
+        let h = CanHeader::Cid {
+            seq: 0xFF,
+            node_id_bits: 0xFFFF,
+            alias: 0xFFFF,
+        };
+        assert_eq!(h.encode(), 0x17FF_FFFF);
+        let h = CanHeader::OtherControl {
+            seq: 0x0B,
+            var: 0x123,
+            alias: 1,
+        };
+        assert_eq!(h.encode() & !0x1FFF_FFFF, 0);
+        assert_eq!((h.encode() >> 24) & 7, 3);
+        let h = CanHeader::Reserved {
+            kind: 0x0E,
+            var: 0,
+            alias: 0,
+        };
+        assert_eq!(h.encode(), 0x1E00_0000);
+    }
+
+    #[test]
+    fn frame_display_parse() {
+        let f = CanFrame::new(0x1949_0ABC, &[1, 2]).unwrap();
+        assert_eq!(alloc::format!("{f}"), ":X19490ABCN0102;");
+        assert_eq!(":X19490ABCN0102;".parse::<CanFrame>().unwrap(), f);
+        assert_eq!(alloc::format!("{f:?}"), "CanFrame(19490ABC [01 02])");
+        assert_eq!(CanFrame::of(0xFFFF_FFFF, &[]).id, 0x1FFF_FFFF);
     }
 }

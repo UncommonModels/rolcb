@@ -145,4 +145,54 @@ mod tests {
             );
         }
     }
+
+    /// Every non-NaN half survives half → f32 → half exactly, keeping the
+    /// sign of zero; every NaN stays NaN.
+    #[test]
+    fn exhaustive_round_trip() {
+        for h in 0..=u16::MAX {
+            let f = to_f32(h);
+            if f.is_nan() {
+                assert_eq!(h & 0x7C00, 0x7C00, "{h:04X}");
+                assert_ne!(h & 0x03FF, 0, "{h:04X}");
+                assert!(to_f32(from_f32(f)).is_nan());
+                continue;
+            }
+            assert_eq!(from_f32(f), h, "{h:04X} -> {f}");
+        }
+    }
+
+    #[test]
+    fn boundaries() {
+        // Largest finite, smallest normal, largest/smallest subnormal.
+        assert_eq!(to_f32(0x7BFF), 65504.0);
+        assert_eq!(to_f32(0x0400), 6.103_515_6e-5);
+        assert_eq!(to_f32(0x03FF), 1023.0 / 16_777_216.0);
+        assert_eq!(to_f32(0x0001), 5.960_464_5e-8);
+        assert_eq!(to_f32(0x7C00), f32::INFINITY);
+        assert_eq!(to_f32(0xFC00), f32::NEG_INFINITY);
+        assert_eq!(from_f32(f32::INFINITY), 0x7C00);
+        assert_eq!(from_f32(f32::NEG_INFINITY), 0xFC00);
+        assert!(to_f32(from_f32(f32::NAN)).is_nan());
+        // Overflow: 65520 is the halfway point to infinity and rounds up.
+        assert_eq!(from_f32(65519.0), 0x7BFF);
+        assert_eq!(from_f32(65520.0), 0x7C00);
+        assert_eq!(from_f32(-1.0e9), 0xFC00);
+        // Underflow: half of the smallest subnormal rounds to even (zero);
+        // just above it rounds up.
+        assert_eq!(from_f32(2.980_232_2e-8), 0x0000);
+        assert_eq!(from_f32(2.980_233e-8), 0x0001);
+        assert_eq!(from_f32(-2.980_232_2e-8), 0x8000);
+        assert_eq!(from_f32(1.0e-10), 0x0000);
+        assert_eq!(from_f32(f32::MIN_POSITIVE), 0x0000);
+        // Subnormal → normal carry.
+        assert_eq!(from_f32(6.102e-5), 0x0400);
+        assert_eq!(from_f32(6.099e-5), 0x03FF);
+        // Round to nearest even in the normal range: 1 + 2^-11 is halfway
+        // between 0x3C00 and 0x3C01 and rounds to the even one.
+        assert_eq!(from_f32(1.0 + 1.0 / 2048.0), 0x3C00);
+        assert_eq!(from_f32(1.0 + 3.0 / 2048.0), 0x3C02);
+        // Mantissa overflow carries into the exponent.
+        assert_eq!(from_f32(2.0 - 1.0 / 4096.0), 0x4000);
+    }
 }

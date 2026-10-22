@@ -22,8 +22,9 @@
 //!      │   restart with next ◄─┘                                  │
 //!      │   candidate alias                                        │
 //!      │                       ◄──────────────────────────────────┘
-//!      │                         someone else *used* our alias:
-//!      │                         AMR, then start over (no 2nd Init Complete)
+//!      │                         someone else *used* our alias, or
+//!      │                         start() called again: AMR, then start
+//!      │                         over (no 2nd Init Complete)
 //!      └──────────── reset() (link lost) ─────────────────────────┘
 //! ```
 //!
@@ -46,12 +47,18 @@
 //! | SNIP Request | SNIP Reply from [`NodeInfo`] |
 //! | Identify Events Global / Addressed to us | Producer/Consumer Identified for every registered event |
 //! | Identify Consumer / Producer for a registered event | Consumer / Producer Identified with its state |
-//! | Datagram to us | Datagram Rejected (`0x1040` not implemented) |
-//! | Traction Command to us, unless [`protocol::TRACTION_CONTROL`] is set | Optional Interaction Rejected |
-//! | Any other unknown addressed message to us | Optional Interaction Rejected |
+//! | Datagram to us | Datagram Rejected (`0x1043`, [`NOT_IMPLEMENTED_UNKNOWN_MTI`](error_code::NOT_IMPLEMENTED_UNKNOWN_MTI)) |
+//! | Traction Command to us, unless [`protocol::TRACTION_CONTROL`] is set or it is a Controller Changing Notify (`20 04`) | Optional Interaction Rejected (`0x1043`) |
+//! | Any other unknown addressed message to us | Optional Interaction Rejected (`0x1043`) |
 //!
+//! Replies (Traction Control Reply, Datagram Received OK / Rejected,
+//! Optional Interaction Rejected, SNIP reply, …) are never rejected.
 //! Everything (including messages that were auto-answered) is still
 //! returned to the application as a [`Received`].
+//!
+//! The node also produces [`EventId::DUPLICATE_NODE_ID`] (as a PCER, once)
+//! the first time it sees another node announce its Node ID; see
+//! [`Node::duplicate_node_id_detected`].
 //!
 //! # Example: login driven by a fake clock
 //!
@@ -94,8 +101,9 @@
 //!
 //! In a real application, call [`Node::poll`] from a timer (every 10-50 ms
 //! is plenty) or sleep until [`Node::next_deadline`], and drain
-//! [`Node::take_outgoing`] after every `start`, `poll`, `receive` and
-//! `send`. The [throttle guide](crate::guide::throttle) shows a complete loop.
+//! [`Node::take_outgoing`] (or [`Node::pop_outgoing`], one frame at a time)
+//! after every `start`, `poll`, `receive` and `send`. The
+//! [throttle guide](crate::guide::throttle) shows a complete loop.
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
@@ -107,6 +115,7 @@ use crate::event::{EventId, EventState};
 use crate::message::{protocol, Assembler, Message, Received};
 use crate::mti::{error_code, Mti};
 use crate::node_id::NodeId;
+use crate::traction;
 
 /// How long to wait after the CID frames before claiming the alias.
 ///
@@ -114,7 +123,10 @@ use crate::node_id::NodeId;
 /// last CID frame and the RID frame, giving nodes that already use the
 /// alias time to object.
 pub const ALIAS_RESERVE_MS: u64 = 200;
-const MAX_PENDING: usize = 512;
+
+/// How many messages [`Node::send`] holds while the node is not yet
+/// permitted. Further messages are dropped ([`Node::try_send`] reports it).
+pub const MAX_PENDING: usize = 512;
 
 /// Simple Node Information, reported to configuration tools such as JMRI.
 ///
@@ -169,6 +181,7 @@ pub struct NodeInfo {
 
 impl NodeInfo {
     /// Encode as a SNIP reply payload.
+    #[must_use]
     ///
     /// Over-long strings are truncated at a UTF-8 character boundary to fit
     /// the field limits shown in the [type docs](NodeInfo).
@@ -198,6 +211,7 @@ impl NodeInfo {
     /// The two version bytes are skipped without checking, missing fields
     /// become empty strings and invalid UTF-8 is replaced with U+FFFD, so
     /// this never fails.
+    #[must_use]
     pub fn from_snip(p: &[u8]) -> NodeInfo {
         let mut fields = Vec::new();
         let mut i = 0;
@@ -269,6 +283,7 @@ impl Node {
     /// The node initially advertises
     /// [`EVENT_EXCHANGE`](protocol::EVENT_EXCHANGE) | [`SNIP`](protocol::SNIP);
     /// change that with [`Node::set_protocols`].
+    #[must_use]
     pub fn new(node_id: NodeId, info: NodeInfo) -> Self {
         Node {
             node_id,
@@ -288,6 +303,7 @@ impl Node {
     }
 
     /// This node's 48-bit Node ID.
+    #[must_use]
     pub fn node_id(&self) -> NodeId {
         self.node_id
     }
@@ -296,6 +312,7 @@ impl Node {
     ///
     /// `None` while inhibited or reserving. The alias can change at runtime
     /// if a collision forces a new reservation, so do not cache it for long.
+    #[must_use]
     pub fn alias(&self) -> Option<u16> {
         match self.state {
             State::Permitted { alias } => Some(alias),
@@ -305,12 +322,19 @@ impl Node {
 
     /// True once the alias is reserved and the node may send messages
     /// (the CAN "Permitted" state).
+    #[must_use]
     pub fn is_permitted(&self) -> bool {
         matches!(self.state, State::Permitted { .. })
     }
 
-    /// True if another node on the bus announced our Node ID. The user must
-    /// configure a different Node ID.
+    /// True if another node on the bus announced our Node ID (in an AMD,
+    /// Initialization Complete or Verified Node ID). The user must configure
+    /// a different Node ID.
+    ///
+    /// The first detection also sends a PCER for
+    /// [`EventId::DUPLICATE_NODE_ID`] (held until login if necessary). The
+    /// flag stays set until the node is recreated.
+    #[must_use]
     pub fn duplicate_node_id_detected(&self) -> bool {
         self.duplicate_node_id
     }
@@ -324,12 +348,46 @@ impl Node {
         self.protocols = flags;
     }
 
+    /// The Protocol Support Inquiry reply flags (see [`Node::set_protocols`]).
+    #[must_use]
+    pub fn protocols(&self) -> u32 {
+        self.protocols
+    }
+
+    /// The Simple Node Information this node reports.
+    #[must_use]
+    pub fn info(&self) -> &NodeInfo {
+        &self.info
+    }
+
+    /// Replace the Simple Node Information. Takes effect with the next SNIP
+    /// request; nothing is sent by itself.
+    pub fn set_info(&mut self, info: NodeInfo) {
+        self.info = info;
+    }
+
     /// Begin (or restart) alias reservation.
     ///
     /// Picks the next candidate alias, queues the four CID frames and arms the
     /// 200 ms timer. Call [`Node::poll`] at or after
     /// [`Node::next_deadline`] to finish the login.
+    ///
+    /// CID frames of an earlier reservation that are still in the outbox are
+    /// dropped, so a restart never puts two sets on the wire.
+    ///
+    /// **Calling `start` while permitted** gives up the current alias: an
+    /// AMR frame for it is queued first, then the node reserves a new alias
+    /// as above. It does not send a second Initialization Complete (use
+    /// [`Node::reset`] first for a full re-login).
     pub fn start(&mut self, now_ms: u64) {
+        self.outbox
+            .retain(|f| !matches!(f.header(), CanHeader::Cid { .. }));
+        if let State::Permitted { alias } = self.state {
+            self.outbox.push_back(CanFrame::of(
+                CanHeader::Amr { alias }.encode(),
+                &self.node_id.to_bytes(),
+            ));
+        }
         let alias = self.alias_gen.next_alias();
         self.outbox.extend(cid_frames(self.node_id, alias));
         self.state = State::Reserving {
@@ -354,6 +412,7 @@ impl Node {
     /// The next time [`Node::poll`] has work to do, if any.
     ///
     /// Only `Some` while an alias reservation is in progress.
+    #[must_use]
     pub fn next_deadline(&self) -> Option<u64> {
         match self.state {
             State::Reserving { until, .. } => Some(until),
@@ -395,14 +454,30 @@ impl Node {
     /// Queue a message for transmission. Messages sent before login completes
     /// are held and sent as soon as the alias is reserved.
     ///
-    /// At most 512 messages are held while offline; further ones are
-    /// dropped. Once permitted, the message is immediately encoded into
-    /// frames; collect them with [`Node::take_outgoing`].
+    /// At most [`MAX_PENDING`] (512) messages are held while offline;
+    /// further ones are silently dropped (use [`Node::try_send`] to find
+    /// out). Once permitted, the message is immediately encoded into frames;
+    /// collect them with [`Node::take_outgoing`].
+    ///
+    /// Encoding uses the lenient rules of [`Message::to_frames`] (without
+    /// its debug assertion); validate untrusted messages with
+    /// [`Message::try_to_frames`] first.
     pub fn send(&mut self, msg: Message) {
+        let _ = self.try_send(msg);
+    }
+
+    /// Like [`Node::send`], but returns `false` if the message was dropped
+    /// because [`MAX_PENDING`] messages are already waiting for login.
+    #[must_use = "the message was dropped if this returns false"]
+    pub fn try_send(&mut self, msg: Message) -> bool {
         if self.is_permitted() {
             self.emit(msg);
+            true
         } else if self.pending.len() < MAX_PENDING {
             self.pending.push_back(msg);
+            true
+        } else {
+            false
         }
     }
 
@@ -410,8 +485,29 @@ impl Node {
     ///
     /// Frames are returned in the order they must be sent. Write each to the
     /// bus (for example with [`gridconnect::format`](crate::gridconnect::format)).
+    #[must_use = "the frames must be written to the bus"]
     pub fn take_outgoing(&mut self) -> Vec<CanFrame> {
         self.outbox.drain(..).collect()
+    }
+
+    /// Remove and return the next frame to transmit, without allocating.
+    ///
+    /// Useful with a CAN driver that has a small transmit queue: pop a frame,
+    /// try to send it, and keep it for later if the driver is full.
+    ///
+    /// ```
+    /// use rolcb::{Node, NodeId, NodeInfo};
+    ///
+    /// let mut node = Node::new(NodeId::new(0x0501_0101_2299), NodeInfo::default());
+    /// node.start(0);
+    /// let mut n = 0;
+    /// while let Some(_frame) = node.pop_outgoing() {
+    ///     n += 1; // write _frame to the driver
+    /// }
+    /// assert_eq!(n, 4); // the CID frames
+    /// ```
+    pub fn pop_outgoing(&mut self) -> Option<CanFrame> {
+        self.outbox.pop_front()
     }
 
     /// Register an event we produce (we send PCERs for it).
@@ -466,6 +562,7 @@ impl Node {
     ///
     /// Returns `None` if the mapping has not been seen yet or was reset by an
     /// AMR.
+    #[must_use]
     pub fn alias_of(&self, node: NodeId) -> Option<u16> {
         self.aliases
             .iter()
@@ -474,6 +571,7 @@ impl Node {
     }
 
     /// Look up the node behind an alias, if known.
+    #[must_use]
     pub fn node_of(&self, alias: u16) -> Option<NodeId> {
         self.aliases.get(&alias).copied()
     }
@@ -484,7 +582,14 @@ impl Node {
     /// Pass every frame read from the bus, including ones addressed to other
     /// nodes. Control frames update alias state and return `None`; the first
     /// frames of multi-frame messages also return `None`. `now_ms` is used
-    /// when an alias collision forces a new reservation.
+    /// when an alias collision forces a new reservation and to expire
+    /// incomplete multi-frame messages (see [`Assembler::accept_at`]).
+    ///
+    /// **Never feed the node its own transmitted frames** (for example from
+    /// a CAN driver or hub that echoes transmissions back). A frame carrying
+    /// our own alias is, by definition, an alias collision: the node would
+    /// release its alias with AMR and log in again, over and over. Filter
+    /// out local echo before calling `receive`.
     ///
     /// ```
     /// use rolcb::node::ALIAS_RESERVE_MS;
@@ -493,7 +598,7 @@ impl Node {
     /// let mut node = Node::new(NodeId::new(0x0501_0101_2299), NodeInfo::default());
     /// node.start(0);
     /// node.poll(ALIAS_RESERVE_MS);
-    /// node.take_outgoing();
+    /// let _ = node.take_outgoing();
     ///
     /// // A PCER from some other node (alias 0x333):
     /// let frame = Message::Pcer(EventId(5)).to_frames(0x333)[0];
@@ -517,10 +622,7 @@ impl Node {
                     self.outbox
                         .push_back(CanFrame::of(CanHeader::Rid { alias }.encode(), &[]));
                 } else {
-                    self.outbox.push_back(CanFrame::of(
-                        CanHeader::Amr { alias }.encode(),
-                        &self.node_id.to_bytes(),
-                    ));
+                    // start() sends AMR for the alias we are giving up.
                     self.start(now_ms);
                 }
                 return None;
@@ -552,16 +654,13 @@ impl Node {
                 }
                 return None;
             }
-            CanHeader::Cid { .. }
-            | CanHeader::Rid { .. }
-            | CanHeader::OtherControl { .. }
-            | CanHeader::Reserved { .. }
-            | CanHeader::Stream { .. } => return None,
             CanHeader::Message { .. } | CanHeader::Datagram { .. } => {}
+            // CID, RID, other control frames, streams, reserved types.
+            _ => return None,
         }
 
-        let raw = self.assembler.accept(frame)?;
-        let msg = Message::from_parts(raw.mti, raw.dest, raw.payload);
+        let raw = self.assembler.accept_at(frame, now_ms)?;
+        let msg = Message::from(raw);
         match &msg {
             Message::InitializationComplete { node_id, .. }
             | Message::VerifiedNodeId { node_id, .. } => {
@@ -581,7 +680,12 @@ impl Node {
 
     fn learn_alias(&mut self, alias: u16, node: NodeId) {
         if node == self.node_id {
-            self.duplicate_node_id = true;
+            if !self.duplicate_node_id {
+                self.duplicate_node_id = true;
+                self.send(Message::Pcer(EventId::DUPLICATE_NODE_ID));
+            }
+            // Never map someone else's alias to our own Node ID.
+            return;
         }
         // An alias change for a known node replaces the old mapping.
         self.aliases.retain(|_, n| *n != node);
@@ -632,22 +736,24 @@ impl Node {
             Message::Datagram { .. } if to_me => {
                 self.emit(Message::DatagramRejected {
                     dest: src,
-                    code: error_code::NOT_IMPLEMENTED,
+                    code: error_code::NOT_IMPLEMENTED_UNKNOWN_MTI,
                 });
             }
             Message::Other { mti, .. } if to_me => {
                 self.emit(Message::OptionalInteractionRejected {
                     dest: src,
-                    code: error_code::NOT_IMPLEMENTED,
+                    code: error_code::NOT_IMPLEMENTED_UNKNOWN_MTI,
                     mti: *mti,
                 });
             }
-            Message::TractionCommand { .. }
-                if to_me && self.protocols & protocol::TRACTION_CONTROL == 0 =>
+            Message::TractionCommand { payload, .. }
+                if to_me
+                    && self.protocols & protocol::TRACTION_CONTROL == 0
+                    && !traction::Command::is_controller_changing_notify(payload) =>
             {
                 self.emit(Message::OptionalInteractionRejected {
                     dest: src,
-                    code: error_code::NOT_IMPLEMENTED,
+                    code: error_code::NOT_IMPLEMENTED_UNKNOWN_MTI,
                     mti: Mti::TRACTION_CONTROL_COMMAND,
                 });
             }
@@ -668,7 +774,7 @@ impl Node {
 
     fn emit(&mut self, msg: Message) {
         if let State::Permitted { alias } = self.state {
-            self.outbox.extend(msg.to_frames(alias));
+            self.outbox.extend(msg.to_frames_lenient(alias));
         }
     }
 }
@@ -699,9 +805,35 @@ mod tests {
         let mut n = node();
         n.start(0);
         n.poll(ALIAS_RESERVE_MS);
-        n.take_outgoing();
+        let _ = n.take_outgoing();
         let a = n.alias().unwrap();
         (n, a)
+    }
+
+    /// Decode a batch of outgoing frames into messages.
+    fn msgs(frames: &[CanFrame]) -> Vec<Message> {
+        let mut asm = Assembler::new();
+        frames
+            .iter()
+            .filter_map(|f| asm.accept(f))
+            .map(Message::from)
+            .collect()
+    }
+
+    /// Feed `msg` from alias 0x111 and return what the node replied.
+    fn reply_to(n: &mut Node, msg: Message) -> Vec<Message> {
+        for f in msg.to_frames(0x111) {
+            let _ = n.receive(&f, 100);
+        }
+        msgs(&n.take_outgoing())
+    }
+
+    fn oir(dest: u16, mti: Mti) -> Message {
+        Message::OptionalInteractionRejected {
+            dest,
+            code: error_code::NOT_IMPLEMENTED_UNKNOWN_MTI,
+            mti,
+        }
     }
 
     #[test]
@@ -910,5 +1042,398 @@ mod tests {
         n.receive(&dup.to_frames(0x444)[0], 0);
         assert!(n.duplicate_node_id_detected());
         let _ = n.node_id().to_string();
+    }
+
+    #[test]
+    fn ame_and_verify_for_other_nodes_are_ignored() {
+        let (mut n, a) = logged_in();
+        let other = NodeId::new(0x0909_0909_0909);
+        // AME naming another node: no AMD.
+        n.receive(
+            &CanFrame::of(CanHeader::Ame { alias: 0x111 }.encode(), &other.to_bytes()),
+            0,
+        );
+        assert!(n.take_outgoing().is_empty());
+        // AME naming us: AMD.
+        n.receive(
+            &CanFrame::of(
+                CanHeader::Ame { alias: 0x111 }.encode(),
+                &n.node_id().to_bytes(),
+            ),
+            0,
+        );
+        assert_eq!(n.take_outgoing()[0].header(), CanHeader::Amd { alias: a });
+        // Verify Node ID Global for another node: no reply.
+        assert!(reply_to(
+            &mut n,
+            Message::VerifyNodeIdGlobal {
+                node_id: Some(other)
+            }
+        )
+        .is_empty());
+        // Verify Node ID Global for us: reply.
+        let me = n.node_id();
+        assert_eq!(
+            reply_to(&mut n, Message::VerifyNodeIdGlobal { node_id: Some(me) }),
+            vec![Message::VerifiedNodeId {
+                node_id: me,
+                simple: false
+            }]
+        );
+        // Verify Node ID Addressed to another alias: no reply.
+        assert!(reply_to(
+            &mut n,
+            Message::VerifyNodeIdAddressed {
+                dest: 0x222,
+                node_id: None
+            }
+        )
+        .is_empty());
+        // …and to us: reply.
+        assert_eq!(
+            reply_to(
+                &mut n,
+                Message::VerifyNodeIdAddressed {
+                    dest: a,
+                    node_id: None
+                }
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn protocol_support_reply_uses_flags() {
+        let (mut n, a) = logged_in();
+        assert_eq!(n.protocols(), protocol::EVENT_EXCHANGE | protocol::SNIP);
+        assert_eq!(
+            reply_to(&mut n, Message::ProtocolSupportInquiry { dest: a }),
+            vec![Message::ProtocolSupportReply {
+                dest: 0x111,
+                flags: protocol::EVENT_EXCHANGE | protocol::SNIP
+            }]
+        );
+        let flags = protocol::DATAGRAM | protocol::TRACTION_CONTROL | protocol::FDI;
+        n.set_protocols(flags);
+        assert_eq!(n.protocols(), flags);
+        assert_eq!(
+            reply_to(&mut n, Message::ProtocolSupportInquiry { dest: a }),
+            vec![Message::ProtocolSupportReply { dest: 0x111, flags }]
+        );
+        // Not to us: nothing.
+        assert!(reply_to(&mut n, Message::ProtocolSupportInquiry { dest: 0x222 }).is_empty());
+    }
+
+    #[test]
+    fn traction_rejected_unless_train() {
+        let (mut n, a) = logged_in();
+        let cmd = Message::TractionCommand {
+            dest: a,
+            payload: crate::traction::Command::QuerySpeed.encode(),
+        };
+        assert_eq!(
+            reply_to(&mut n, cmd.clone()),
+            vec![oir(0x111, Mti::TRACTION_CONTROL_COMMAND)]
+        );
+        // To another node: nothing.
+        let other = Message::TractionCommand {
+            dest: 0x222,
+            payload: vec![0x10],
+        };
+        assert!(reply_to(&mut n, other).is_empty());
+        // A train handles traction itself.
+        n.set_protocols(protocol::TRACTION_CONTROL);
+        assert!(reply_to(&mut n, cmd).is_empty());
+    }
+
+    #[test]
+    fn controller_changing_notify_is_delivered_not_rejected() {
+        let (mut n, a) = logged_in();
+        let notify = crate::traction::Command::ControllerChangingNotify {
+            flags: 0,
+            new_controller: NodeId::new(0x0501_0101_2277),
+        };
+        let m = Message::TractionCommand {
+            dest: a,
+            payload: notify.encode(),
+        };
+        let frames = m.to_frames(0x6A1);
+        assert_eq!(frames.len(), 2);
+        assert!(n.receive(&frames[0], 0).is_none());
+        let rx = n.receive(&frames[1], 0).expect("delivered");
+        assert_eq!(rx.msg, m);
+        assert!(
+            n.take_outgoing().is_empty(),
+            "no OIR for Controller Changing Notify"
+        );
+    }
+
+    #[test]
+    fn datagram_rejected_with_1043() {
+        let (mut n, a) = logged_in();
+        for len in [0usize, 8, 9, 72] {
+            let d = Message::Datagram {
+                dest: a,
+                data: vec![0x20; len],
+            };
+            assert_eq!(
+                reply_to(&mut n, d),
+                vec![Message::DatagramRejected {
+                    dest: 0x111,
+                    code: error_code::NOT_IMPLEMENTED_UNKNOWN_MTI
+                }],
+                "{len}-byte datagram"
+            );
+        }
+        // Datagram to someone else: nothing.
+        assert!(reply_to(
+            &mut n,
+            Message::Datagram {
+                dest: 0x222,
+                data: vec![1]
+            }
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn unknown_addressed_gets_1043() {
+        let (mut n, a) = logged_in();
+        let m = Message::Other {
+            mti: Mti(0x0DA8),
+            dest: Some(a),
+            payload: vec![1, 2],
+        };
+        assert_eq!(reply_to(&mut n, m), vec![oir(0x111, Mti(0x0DA8))]);
+        // Unknown *global* MTI: nothing.
+        let m = Message::Other {
+            mti: Mti(0x0DA0),
+            dest: None,
+            payload: vec![],
+        };
+        assert!(reply_to(&mut n, m).is_empty());
+    }
+
+    #[test]
+    fn replies_are_never_rejected() {
+        let (mut n, a) = logged_in();
+        for m in [
+            Message::TractionReply {
+                dest: a,
+                payload: crate::traction::Reply::Heartbeat { timeout_s: 3 }.encode(),
+            },
+            Message::OptionalInteractionRejected {
+                dest: a,
+                code: 0x1043,
+                mti: Mti::DATAGRAM,
+            },
+            Message::TerminateDueToError {
+                dest: a,
+                code: 0x2000,
+                mti: Mti::DATAGRAM,
+            },
+            Message::DatagramReceivedOk { dest: a, flags: 0 },
+            Message::DatagramRejected {
+                dest: a,
+                code: 0x2020,
+            },
+            Message::ProtocolSupportReply {
+                dest: a,
+                flags: protocol::SNIP,
+            },
+            Message::SnipReply {
+                dest: a,
+                data: NodeInfo::default().snip_payload(),
+            },
+            Message::VerifiedNodeId {
+                node_id: NodeId::new(0x0909_0909_0909),
+                simple: false,
+            },
+        ] {
+            assert!(reply_to(&mut n, m.clone()).is_empty(), "{m:?}");
+        }
+    }
+
+    #[test]
+    fn reset_and_start_reannounces() {
+        let mut n = node();
+        let e = EventId(0x0501_0101_2200_0001);
+        n.add_producer(e, EventState::Valid);
+        n.start(0);
+        n.poll(ALIAS_RESERVE_MS);
+        let first = msgs(&n.take_outgoing());
+        assert!(matches!(first[0], Message::InitializationComplete { .. }));
+
+        n.reset();
+        assert!(!n.is_permitted());
+        assert_eq!(n.alias(), None);
+        assert!(n.take_outgoing().is_empty());
+        n.start(1000);
+        n.poll(1000 + ALIAS_RESERVE_MS);
+        let again = msgs(&n.take_outgoing());
+        assert_eq!(again, first, "Init Complete and Identified are sent again");
+    }
+
+    #[test]
+    fn pending_cap_and_try_send() {
+        let mut n = node();
+        for i in 0..MAX_PENDING {
+            assert!(n.try_send(Message::Pcer(EventId(i as u64))));
+        }
+        assert!(!n.try_send(Message::Pcer(EventId(9999))));
+        n.send(Message::Pcer(EventId(9999))); // silently dropped
+        n.start(0);
+        n.poll(ALIAS_RESERVE_MS);
+        let out = msgs(&n.take_outgoing());
+        // Init Complete + the held messages, in order.
+        assert_eq!(out.len(), 1 + MAX_PENDING);
+        assert_eq!(out[1], Message::Pcer(EventId(0)));
+        assert_eq!(
+            out[MAX_PENDING],
+            Message::Pcer(EventId(MAX_PENDING as u64 - 1))
+        );
+        // Once permitted, try_send always succeeds.
+        assert!(n.try_send(Message::Pcer(EventId(9999))));
+    }
+
+    #[test]
+    fn duplicate_node_id_via_amd_sends_pcer_once() {
+        let (mut n, _) = logged_in();
+        let amd = CanFrame::of(
+            CanHeader::Amd { alias: 0x444 }.encode(),
+            &n.node_id().to_bytes(),
+        );
+        n.receive(&amd, 0);
+        assert!(n.duplicate_node_id_detected());
+        assert_eq!(
+            msgs(&n.take_outgoing()),
+            vec![Message::Pcer(EventId::DUPLICATE_NODE_ID)]
+        );
+        // Our own Node ID is never mapped to someone else's alias.
+        assert_eq!(n.alias_of(n.node_id()), None);
+        // Second detection: no second PCER.
+        n.receive(&amd, 10);
+        let dup = Message::VerifiedNodeId {
+            node_id: n.node_id(),
+            simple: false,
+        };
+        n.receive(&dup.to_frames(0x445)[0], 20);
+        assert!(n.take_outgoing().is_empty());
+    }
+
+    #[test]
+    fn duplicate_before_login_is_held() {
+        let mut n = node();
+        n.start(0);
+        let _ = n.take_outgoing();
+        let amd = CanFrame::of(
+            CanHeader::Amd { alias: 0x444 }.encode(),
+            &n.node_id().to_bytes(),
+        );
+        n.receive(&amd, 50);
+        assert!(n.duplicate_node_id_detected());
+        n.poll(ALIAS_RESERVE_MS);
+        let out = msgs(&n.take_outgoing());
+        assert!(
+            out.contains(&Message::Pcer(EventId::DUPLICATE_NODE_ID)),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn collision_restart_drops_queued_cids() {
+        let mut n = node();
+        n.start(0);
+        // Not drained: the first CIDs are still queued when the collision hits.
+        let first = n.outbox[0].src_alias();
+        let other = Message::Pcer(EventId(1)).to_frames(first)[0];
+        assert!(n.receive(&other, 50).is_none());
+        let out = n.take_outgoing();
+        assert_eq!(out.len(), 4, "only the new CIDs");
+        assert!(out.iter().all(|f| f.src_alias() != first));
+        // An explicit restart while reserving also replaces them.
+        n.start(60);
+        n.start(70);
+        assert_eq!(n.take_outgoing().len(), 4);
+    }
+
+    #[test]
+    fn start_while_permitted_sends_amr_first() {
+        let (mut n, a) = logged_in();
+        n.start(500);
+        let out = n.take_outgoing();
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0].header(), CanHeader::Amr { alias: a });
+        assert_eq!(out[0].data(), n.node_id().to_bytes());
+        assert!(out[1..]
+            .iter()
+            .all(|f| matches!(f.header(), CanHeader::Cid { .. })));
+        assert!(!n.is_permitted());
+        n.poll(500 + ALIAS_RESERVE_MS);
+        let out = n.take_outgoing();
+        assert_eq!(out.len(), 2, "RID + AMD, no second Init Complete");
+        assert_ne!(n.alias(), Some(a));
+    }
+
+    #[test]
+    fn rid_and_amd_from_our_alias_while_reserving_restart() {
+        let mut n = node();
+        n.start(0);
+        let first = n.take_outgoing()[0].src_alias();
+        let rid = CanFrame::of(CanHeader::Rid { alias: first }.encode(), &[]);
+        n.receive(&rid, 10);
+        let second = n.take_outgoing()[0].src_alias();
+        assert_ne!(first, second);
+        // A CID for our candidate from someone else also restarts.
+        let cid = cid_frames(NodeId::new(0x0909_0909_0909), second)[0];
+        n.receive(&cid, 20);
+        assert_ne!(n.take_outgoing()[0].src_alias(), second);
+    }
+
+    #[test]
+    fn pop_outgoing_info_and_set_info() {
+        let mut n = node();
+        assert_eq!(n.info().model, "Test");
+        n.set_info(NodeInfo {
+            model: "Changed".into(),
+            ..Default::default()
+        });
+        assert_eq!(n.info().model, "Changed");
+        n.start(0);
+        let mut popped = Vec::new();
+        while let Some(f) = n.pop_outgoing() {
+            popped.push(f);
+        }
+        assert_eq!(popped.len(), 4);
+        assert!(n.pop_outgoing().is_none());
+        n.poll(ALIAS_RESERVE_MS);
+        let a = n.alias().unwrap();
+        let _ = n.take_outgoing();
+        let snip = reply_to(&mut n, Message::SnipRequest { dest: a });
+        match &snip[..] {
+            [Message::SnipReply { data, .. }] => {
+                assert_eq!(NodeInfo::from_snip(data).model, "Changed")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn incomplete_multiframe_expires() {
+        let (mut n, a) = logged_in();
+        let m = Message::TractionReply {
+            dest: a,
+            payload: vec![1; 10],
+        };
+        let f = m.to_frames(0x111);
+        assert!(n.receive(&f[0], 1_000).is_none());
+        // The last frame arrives too late: the partial was dropped.
+        assert!(n
+            .receive(&f[1], 1_000 + crate::message::PARTIAL_TIMEOUT_MS)
+            .is_none());
+        // In time, it completes.
+        assert!(n.receive(&f[0], 10_000).is_none());
+        assert_eq!(n.receive(&f[1], 10_100).unwrap().msg, m);
     }
 }

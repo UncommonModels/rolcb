@@ -20,8 +20,10 @@ A throttle never talks DCC. It:
    (`ALLOCATE` flag), and the train node answers Producer Identified for
    that same event. The source alias of the answer *is* the train.
 2. **Assigns** itself as the train's controller (Assign Controller). From
-   then on it is the train's owner; another throttle that takes over
-   causes a Controller Changed notification.
+   then on it is the train's owner. If another throttle asks for the
+   train, the train sends the current owner a *Controller Changing
+   Notify* command, and the owner answers whether it agrees (see
+   [below](#losing-control-to-another-throttle)).
 3. **Drives** it with Set Speed / Set Function, and may query state.
 4. **Answers heartbeats.** A train may ask its controller to prove it is
    still alive by sending a heartbeat request with a timeout; the throttle
@@ -231,7 +233,82 @@ assert_eq!(st.speed, Speed::STOP_REVERSE);
 throttle.send(cmd(Command::ReleaseController { flags: 0, controller: me }));
 round_trip(&mut throttle, &mut train, &mut st, now);
 assert_eq!(st.controller, None);
+
+// ---------------------------------------------------------------------------
+// 7. Losing control. We take the train again, then another throttle asks for
+//    it: the train sends *us* a Controller Changing Notify command.
+// ---------------------------------------------------------------------------
+throttle.send(cmd(Command::AssignController { flags: 0, controller: me }));
+round_trip(&mut throttle, &mut train, &mut st, now);
+assert_eq!(st.controller, Some(me));
+
+let other_throttle = NodeId::new(0x0501_0101_2277);
+train.send(Message::TractionCommand {
+    dest: my_alias,
+    payload: Command::ControllerChangingNotify { flags: 0, new_controller: other_throttle }
+        .encode(),
+});
+
+let mut lost = false;
+for rx in deliver(&mut train, &mut throttle, now) {
+    // The throttle's Node delivers this command instead of rejecting it,
+    // even though the throttle does not advertise TRACTION_CONTROL.
+    if let Message::TractionCommand { payload, .. } = &rx.msg {
+        if let Command::ControllerChangingNotify { new_controller, .. } = Command::decode(payload) {
+            // Agree to the handover (result 0)…
+            throttle.send(Message::TractionReply {
+                dest: rx.src_alias,
+                payload: Reply::ControllerChanged { result: 0 }.encode(),
+            });
+            // …and mark the train as lost: stop sending it commands, stop
+            // answering its heartbeats, and tell the user.
+            lost = true;
+            println!("train taken over by {new_controller}");
+        }
+    }
+}
+assert!(lost);
+
+// Exactly one frame went back: our answer, not an Optional Interaction Rejected.
+let answers = deliver(&mut throttle, &mut train, now);
+match &answers[..] {
+    [rx] => match &rx.msg {
+        Message::TractionReply { payload, .. } => {
+            assert_eq!(Reply::decode(payload), Reply::ControllerChanged { result: 0 })
+        }
+        m => panic!("unexpected {m:?}"),
+    },
+    other => panic!("unexpected {other:?}"),
+}
 ```
+
+## Losing control to another throttle
+
+When a second throttle sends Assign Controller for a train you control,
+the train does not simply switch. It first sends **you** a Traction Control
+*Command*, [`Command::ControllerChangingNotify`](crate::traction::Command::ControllerChangingNotify)
+(`20 04 flags NodeID`, with the Node ID of the throttle that wants the
+train), and waits for your *reply*,
+[`Reply::ControllerChanged`](crate::traction::Reply::ControllerChanged)
+(`20 04 result`):
+
+| You answer | Meaning | Then |
+|---|---|---|
+| `result: 0` | handover accepted | the train assigns the new throttle; treat the train as lost |
+| nonzero | handover refused | the train rejects the other throttle's Assign Controller |
+
+Step 7 above shows the exchange. Three things to get right:
+
+* **Look for it in `TractionCommand`, not `TractionReply`.** It is the one
+  traction *command* a throttle ever receives. [`Node`](crate::Node) never
+  auto-rejects a command starting `20 04`, whether or not you advertise
+  [`TRACTION_CONTROL`](crate::message::protocol::TRACTION_CONTROL).
+* **Answer it.** If you stay silent the train may wait and eventually
+  decide for you; answering promptly keeps the handover snappy.
+* **Mark the throttle as lost** once you accept: stop sending speed
+  commands and Noops to that train and tell the user. Most throttles
+  accept by default and offer a "steal back" by sending Assign Controller
+  again.
 
 ## Notes for a real throttle
 
@@ -247,9 +324,11 @@ assert_eq!(st.controller, None);
 * **Heartbeat timing.** Respond to [`Reply::Heartbeat`](crate::traction::Reply::Heartbeat)
   well within the timeout, or simply send a [`Command::Noop`](crate::traction::Command::Noop)
   (or a Set Speed) every few seconds while you own the train.
-* **Controller Changed.** If another throttle assigns itself,
-  the train may send [`Reply::ControllerChanged`](crate::traction::Reply::ControllerChanged).
-  Stop sending commands and tell the user they lost the train.
+* **Controller handover.** If another throttle assigns itself, the train
+  sends you [`Command::ControllerChangingNotify`](crate::traction::Command::ControllerChangingNotify);
+  answer with [`Reply::ControllerChanged`](crate::traction::Reply::ControllerChanged)
+  and, if you accepted, tell the user they lost the train (see
+  [above](#losing-control-to-another-throttle)).
 * **Speed steps vs m/s.** DCC command stations conventionally map 1 scale
   mph to one 128-step speed step (126 mph = full speed), which is why
   [`Speed::from_mph`](crate::traction::Speed::from_mph) exists. Use

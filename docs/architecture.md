@@ -30,7 +30,7 @@ code, and shows complete driver loops for common environments.
  └───────────────┬───────────────────────────────────▲────────────────┘
                  ▼          bytes / text             │
  ┌────────────────────────────────────────────────────────────────────┐
- │ YOUR I/O: serial port, TCP socket, WebSocket, SocketCAN, MCU CAN   │
+ │ YOUR I/O: serial port, TCP socket, SocketCAN, MCU CAN              │
  │           (or the `hub` module, which does this part for you)      │
  └────────────────────────────────────────────────────────────────────┘
 ```
@@ -44,7 +44,7 @@ nothing above `gridconnect`.
 ## Why sans-IO
 
 * **One implementation everywhere.** The same `Node` runs under tokio,
-  in a browser (WASM, driven by `WebSocket` callbacks and
+  in a browser (WASM, driven by Web Serial reads and
   `requestAnimationFrame`), on a microcontroller with an interrupt-driven
   CAN peripheral, or in a plain thread with blocking sockets.
 * **Deterministic tests.** Time is a parameter, so the 200 ms alias wait,
@@ -64,7 +64,7 @@ A [`Node`](crate::Node) has a small surface:
 | [`poll(now)`](crate::Node::poll) | periodically, or at [`next_deadline()`](crate::Node::next_deadline) | finishes login when the timer expires |
 | [`receive(&frame, now)`](crate::Node::receive) | for **every** frame read | updates alias state, queues auto-replies, returns decoded messages |
 | [`send(msg)`](crate::Node::send) | whenever the app wants | encodes immediately, or holds it until login completes |
-| [`take_outgoing()`](crate::Node::take_outgoing) | after any of the above | returns frames to write, in order |
+| [`take_outgoing()`](crate::Node::take_outgoing) / [`pop_outgoing()`](crate::Node::pop_outgoing) | after any of the above | returns frames to write, in order (all at once / one at a time) |
 | [`reset()`](crate::Node::reset) | when the link drops | back to inhibited; call `start` again on reconnect |
 
 Rules of thumb:
@@ -219,12 +219,12 @@ let capture = b":X10701285N050101012200;\n:X19100285N050101012200;\n:X195B4285N0
 let mut decoder = Decoder::new();
 let mut asm = Assembler::new();
 let mut log = Vec::new();
+let now_ms = 0; // a live tool passes a monotonic clock so partials expire
 for frame in decoder.push(capture).into_iter().flatten() {
-    match asm.accept(&frame) {
+    match asm.accept_at(&frame, now_ms) {
         Some(raw) => {
-            let msg = Message::from_parts(raw.mti, raw.dest, raw.payload);
-            log.push(format!("{:03X} {}", raw.src_alias, raw.mti.name()));
-            let _ = msg;
+            log.push(format!("{:03X} {}", raw.src_alias, raw.mti));
+            let _msg = Message::from(raw);
         }
         None => {
             if let CanHeader::Amd { alias } = frame.header() {
@@ -233,7 +233,7 @@ for frame in decoder.push(capture).into_iter().flatten() {
         }
     }
 }
-assert_eq!(log, ["285 AMD", "285 InitComplete", "285 PCER"]);
+assert_eq!(log, ["285 AMD", "285 InitComplete (0x0100)", "285 PCER (0x05B4)"]);
 ```
 
 ## Memory and allocation

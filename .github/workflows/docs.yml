@@ -32,34 +32,16 @@ jobs:
       - name: Run doctests (guide examples included)
         run: cargo test --doc --all-features
 
-      - name: Build docs
-        env:
-          RUSTDOCFLAGS: --cfg docsrs -D warnings -D rustdoc::broken_intra_doc_links
-        run: cargo doc --no-deps --all-features
-
-      - name: Add root redirect
-        run: |
-          cat > target/doc/index.html <<'HTML'
-          <!DOCTYPE html>
-          <html lang="en">
-          <head>
-          <meta charset="utf-8">
-          <title>rolcb documentation</title>
-          <meta http-equiv="refresh" content="0; url=rolcb/index.html">
-          <link rel="canonical" href="rolcb/index.html">
-          </head>
-          <body><p>Redirecting to <a href="rolcb/index.html">rolcb/index.html</a>…</p></body>
-          </html>
-          HTML
-          touch target/doc/.nojekyll
-          # upload-pages-artifact rejects symlinks and the cargo lock file.
-          rm -f target/doc/.lock
+      # Builds with nightly + `--cfg docsrs` (warnings are errors) and puts the
+      # crate at the site root (/rolcb/... not /rolcb/rolcb/...) in target/site.
+      - name: Build docs site
+        run: bash scripts/build-docs.sh
 
       - uses: actions/configure-pages@v5
 
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: target/doc
+          path: target/site
 
   deploy:
     needs: build

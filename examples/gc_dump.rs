@@ -28,9 +28,11 @@ fn main() -> io::Result<()> {
             };
             match frame.header() {
                 CanHeader::Message { .. } | CanHeader::Datagram { .. } => {
+                    // A capture has no clock; plain `accept` never expires partials.
                     if let Some(raw) = assembler.accept(&frame) {
-                        let msg = Message::from_parts(raw.mti, raw.dest, raw.payload);
-                        println!("{:03X} {:<28} {msg:?}", raw.src_alias, raw.mti.name());
+                        let (src, name) = (raw.src_alias, raw.mti.name());
+                        let msg = Message::from(raw);
+                        println!("{src:03X} {name:<28} {msg:?}");
                     }
                 }
                 h => println!("{:03X} {h:?} {:02X?}", h.src_alias(), frame.data()),

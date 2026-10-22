@@ -19,7 +19,7 @@ With `std` off:
 | Available | Not available |
 |---|---|
 | `can`, `gridconnect`, `message`, `node`, `traction`, `event`, `node_id`, `mti`, `float16`, `alias` | `hub` (needs tokio) |
-| `ParseError` with `Display` | `impl std::error::Error for ParseError` |
+| `ParseError` and `EncodeError` with `Display` and `core::error::Error` (the same trait as `std::error::Error`) | |
 | `serde` support (feature `serde`) | |
 
 Check that a build really is `no_std`:
@@ -46,107 +46,128 @@ Only the 200 ms alias reservation wait depends on time, so a coarse clock
 
 ## In the browser
 
-A typical browser app (such as a dispatch panel or a web throttle) runs
-one `Node` in WASM and talks to `rolcb-hub` over a WebSocket:
+A browser app (such as a dispatch panel or a web throttle) can run one
+`Node` in WASM and talk to a GridConnect USB-CAN adapter directly through
+the [Web Serial API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Serial_API)
+(Chromium-based browsers):
 
 ```text
   ┌──────────── browser tab ─────────────┐
   │  UI (JS / Yew / Leptos / Dioxus)     │
   │        ▲ events, speeds              │
-  │  rolcb::Node  (WASM)                 │          ┌───────────┐
-  │        ▲ CanFrame                    │  ws://   │ rolcb-hub │── CAN / JMRI
-  │  gridconnect::{format, Decoder}  ◄───┼─────────►│   :12022  │
-  └──────────────────────────────────────┘   text   └───────────┘
+  │  rolcb::Node  (WASM)                 │  Web     ┌─────────────┐
+  │        ▲ CanFrame                    │  Serial  │ USB-CAN     │── CAN bus
+  │  gridconnect::{format, Decoder}  ◄───┼─────────►│ adapter     │
+  └──────────────────────────────────────┘  bytes   └─────────────┘
 ```
 
-The glue is small. With `wasm-bindgen` and `web-sys` (not dependencies of
-this crate, so this snippet is not compiled):
+The glue is small. This sketch uses `wasm-bindgen`, `wasm-bindgen-futures`,
+`js-sys` and `web-sys` (not dependencies of this crate, so it is not
+compiled). web-sys only exposes `Serial` when built with
+`RUSTFLAGS="--cfg=web_sys_unstable_apis"` and the `Navigator`, `Serial`,
+`SerialPort`, `SerialOptions`, `ReadableStream`,
+`ReadableStreamDefaultReader`, `WritableStream` and
+`WritableStreamDefaultWriter` features. That API is unstable, so expect the
+exact method names to drift between web-sys releases:
 
 ```rust,ignore
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use js_sys::{Reflect, Uint8Array};
 use rolcb::gridconnect::{self, Decoder};
 use rolcb::{Node, NodeInfo};
 use wasm_bindgen::prelude::*;
-use web_sys::{MessageEvent, WebSocket};
+use wasm_bindgen_futures::{spawn_local, JsFuture};
+use web_sys::{ReadableStreamDefaultReader, SerialOptions, SerialPort, WritableStreamDefaultWriter};
 
 fn now_ms() -> u64 {
     web_sys::window().unwrap().performance().unwrap().now() as u64
 }
 
-fn flush(node: &mut Node, ws: &WebSocket) {
+fn flush(node: &mut Node, writer: &WritableStreamDefaultWriter) {
     let mut text = String::new();
     for f in node.take_outgoing() {
         text.push_str(&gridconnect::format(&f));
         text.push('\n');
     }
     if !text.is_empty() {
-        let _ = ws.send_with_str(&text);
+        // Writes are queued by the stream in order; no need to await each one.
+        let _ = writer.write_with_chunk(&Uint8Array::from(text.as_bytes()));
     }
 }
 
-#[wasm_bindgen(start)]
-pub fn start() -> Result<(), JsValue> {
-    let ws = WebSocket::new("ws://localhost:12022/")?;
+/// Call from a button's click handler: `requestPort` needs a user gesture.
+#[wasm_bindgen]
+pub async fn connect() -> Result<(), JsValue> {
+    let serial = web_sys::window().unwrap().navigator().serial();
+    let port: SerialPort = JsFuture::from(serial.request_port()).await?.dyn_into()?;
+    JsFuture::from(port.open(&SerialOptions::new(115_200))).await?;
+
+    let reader: ReadableStreamDefaultReader = port.readable().get_reader().dyn_into()?;
+    let writer = Rc::new(port.writable().get_writer()?);
     let node = Rc::new(RefCell::new(Node::new(
         "05.01.01.01.22.97".parse().unwrap(),
         NodeInfo::default(),
     )));
-    let decoder = Rc::new(RefCell::new(Decoder::new()));
 
-    // Frames from the hub.
+    // Log in, then poll on a timer.
     {
-        let (node, decoder, ws2) = (node.clone(), decoder.clone(), ws.clone());
-        let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
-            let Some(text) = e.data().as_string() else { return };
-            let mut node = node.borrow_mut();
-            for frame in decoder.borrow_mut().push(text.as_bytes()).into_iter().flatten() {
-                if let Some(rx) = node.receive(&frame, now_ms()) {
-                    // hand rx.msg to the UI
-                }
-            }
-            flush(&mut node, &ws2);
-        });
-        ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-        onmessage.forget();
-    }
-    // Log in once the socket is open, and poll on a timer.
-    {
-        let (node, ws2) = (node.clone(), ws.clone());
-        let onopen = Closure::<dyn FnMut()>::new(move || {
-            let mut node = node.borrow_mut();
-            node.start(now_ms());
-            flush(&mut node, &ws2);
-        });
-        ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
-        onopen.forget();
+        let mut n = node.borrow_mut();
+        n.start(now_ms());
+        flush(&mut n, &writer);
     }
     {
-        let (node, ws2) = (node.clone(), ws.clone());
+        let (node, writer) = (node.clone(), writer.clone());
         let tick = Closure::<dyn FnMut()>::new(move || {
             let mut node = node.borrow_mut();
             node.poll(now_ms());
-            flush(&mut node, &ws2);
+            flush(&mut node, &writer);
         });
         web_sys::window()
             .unwrap()
             .set_interval_with_callback_and_timeout_and_arguments_0(tick.as_ref().unchecked_ref(), 50)?;
         tick.forget();
     }
+
+    // Bytes from the adapter.
+    spawn_local(async move {
+        let mut decoder = Decoder::new();
+        loop {
+            let Ok(chunk) = JsFuture::from(reader.read()).await else { break };
+            if Reflect::get(&chunk, &"done".into()).unwrap().is_truthy() {
+                break; // adapter unplugged or port closed
+            }
+            let bytes = Uint8Array::new(&Reflect::get(&chunk, &"value".into()).unwrap()).to_vec();
+            let mut node = node.borrow_mut();
+            for frame in decoder.push(&bytes).into_iter().flatten() {
+                if let Some(rx) = node.receive(&frame, now_ms()) {
+                    // hand rx.msg to the UI
+                }
+            }
+            flush(&mut node, &writer);
+        }
+    });
     Ok(())
 }
 ```
 
+The same shape works for any other transport a browser offers (WebUSB, a
+`fetch` stream, a JS bridge to a native app): push whatever bytes arrive
+into a [`Decoder`](crate::gridconnect::Decoder), hand each frame to
+[`Node::receive`](crate::Node::receive), and write
+[`take_outgoing`](crate::Node::take_outgoing) back out as GridConnect text.
+
 Points to remember in the browser:
 
-* When the socket closes, call [`Node::reset`](crate::Node::reset), then
-  [`Node::start`](crate::Node::start) again after reconnecting. The alias
+* When the adapter is unplugged or the port closes, call
+  [`Node::reset`](crate::Node::reset), then
+  [`Node::start`](crate::Node::start) again after reopening it. The alias
   table and partial messages are cleared; registered events are kept and
   re-announced.
 * Pick a Node ID per installation (for example store a random
-  `05.01.01.01.xx.xx` in `localStorage`); two tabs with the same Node ID
-  will see each other as duplicates
+  `05.01.01.01.xx.xx` in `localStorage`); two browsers with the same Node
+  ID on one bus will see each other as duplicates
   ([`Node::duplicate_node_id_detected`](crate::Node::duplicate_node_id_detected)).
 * With the `serde` feature, `NodeId` and `EventId` serialize as
   `"05.01.01.01.22.00.00.10"` strings, which is convenient for passing

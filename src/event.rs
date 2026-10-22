@@ -58,18 +58,25 @@ impl EventId {
     pub const CLEAR_EMERGENCY_STOP: EventId = EventId(0x0100_0000_0000_FFFC);
     /// Well-known: this node is a train (Traction protocol).
     pub const IS_TRAIN: EventId = EventId(0x0101_0000_0000_0303);
+    /// Well-known: a node detected another node using its Node ID
+    /// (`01.01.00.00.00.00.02.01`). [`Node`](crate::Node) produces this once,
+    /// as a PCER, when it first detects a duplicate.
+    pub const DUPLICATE_NODE_ID: EventId = EventId(0x0101_0000_0000_0201);
 
     /// Wrap a raw 64-bit value. Same as `EventId(v)`, usable in `const`.
+    #[must_use]
     pub const fn new(v: u64) -> Self {
         EventId(v)
     }
 
     /// The raw 64-bit value.
+    #[must_use]
     pub const fn as_u64(self) -> u64 {
         self.0
     }
 
     /// The eight big-endian bytes, as carried in event messages.
+    #[must_use]
     pub fn to_bytes(self) -> [u8; 8] {
         self.0.to_be_bytes()
     }
@@ -81,8 +88,27 @@ impl EventId {
     ///
     /// [`ParseError::Length`] if `b` is shorter than eight bytes.
     pub fn from_bytes(b: &[u8]) -> Result<Self, ParseError> {
-        let arr: [u8; 8] = b.get(..8).ok_or(ParseError::Length)?.try_into().unwrap();
-        Ok(EventId(u64::from_be_bytes(arr)))
+        let arr = b.first_chunk::<8>().ok_or(ParseError::Length)?;
+        Ok(EventId(u64::from_be_bytes(*arr)))
+    }
+}
+
+impl From<u64> for EventId {
+    fn from(v: u64) -> Self {
+        EventId(v)
+    }
+}
+
+impl From<[u8; 8]> for EventId {
+    /// Big-endian bytes, as on the wire.
+    fn from(b: [u8; 8]) -> Self {
+        EventId(u64::from_be_bytes(b))
+    }
+}
+
+impl From<EventId> for u64 {
+    fn from(e: EventId) -> u64 {
+        e.0
     }
 }
 
@@ -106,7 +132,6 @@ impl FromStr for EventId {
 }
 
 #[cfg(feature = "serde")]
-#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
 impl serde::Serialize for EventId {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.collect_str(self)
@@ -114,7 +139,6 @@ impl serde::Serialize for EventId {
 }
 
 #[cfg(feature = "serde")]
-#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
 impl<'de> serde::Deserialize<'de> for EventId {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = <alloc::string::String as serde::Deserialize>::deserialize(d)?;
@@ -165,5 +189,32 @@ mod tests {
         assert_eq!(EventId::from_bytes(&e.to_bytes()).unwrap(), e);
         assert!("05.01.01.01.22.00.00".parse::<EventId>().is_err());
         assert!("05.01.01.01.22.00.00.1G".parse::<EventId>().is_err());
+    }
+
+    #[test]
+    fn conversions() {
+        let e = EventId(0x0501_0101_2200_0010);
+        assert_eq!(EventId::from(0x0501_0101_2200_0010_u64), e);
+        assert_eq!(EventId::from(e.to_bytes()), e);
+        assert_eq!(u64::from(e), 0x0501_0101_2200_0010);
+        assert_eq!(EventId::from_bytes(&[0; 7]), Err(ParseError::Length));
+        assert_eq!(
+            EventId::DUPLICATE_NODE_ID.to_string(),
+            "01.01.00.00.00.00.02.01"
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_round_trip() {
+        let e = EventId(0x0501_0101_2200_0010);
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(json, "\"05.01.01.01.22.00.00.10\"");
+        assert_eq!(serde_json::from_str::<EventId>(&json).unwrap(), e);
+        assert!(serde_json::from_str::<EventId>("\"05.01.01\"").is_err());
+        for s in [EventState::Valid, EventState::Invalid, EventState::Unknown] {
+            let j = serde_json::to_string(&s).unwrap();
+            assert_eq!(serde_json::from_str::<EventState>(&j).unwrap(), s);
+        }
     }
 }

@@ -27,7 +27,7 @@
 //! | [`node`] | A virtual [`Node`]: alias reservation, login, standard replies, event identification | Message Network, Event Transport, SNIP |
 //! | [`traction`] | Traction Control payloads, [`Speed`](traction::Speed), train search | Traction Control, Train Search |
 //! | [`event`], [`node_id`], [`mti`], [`float16`] | Basic types | Event Identifiers, Unique Identifiers |
-//! | `hub` *(feature `hub`)* | Async GridConnect hub over TCP, WebSocket and serial | — |
+//! | `hub` *(feature `hub`)* | Async GridConnect hub over TCP and serial | — |
 //!
 //! The `rolcb-hub` binary (feature `cli`) packages the hub as a standalone
 //! program.
@@ -54,11 +54,24 @@
 //!
 //! | Feature | Default | Enables | Dependencies |
 //! |---|---|---|---|
-//! | `std` | yes | `std::error::Error` for [`ParseError`]. Without it the crate is `no_std` + `alloc`. | — |
+//! | `std` | yes | Links `std`. Without it the crate is `no_std` + `alloc`; everything except the hub works the same ([`ParseError`] implements `core::error::Error` either way). | — |
 //! | `serde` | no | `Serialize`/`Deserialize` for [`NodeId`] and [`EventId`] (as dotted-hex strings) and [`EventState`] | `serde` (no_std compatible) |
-//! | `hub` | no | The async `hub` module | `std`, `tokio`, `tokio-tungstenite`, `futures-util` |
+//! | `hub` | no | The async `hub` module (library only) | `std`, `tokio` |
 //! | `serial` | no | `hub::uplink_serial` for USB GridConnect adapters | `hub`, `tokio-serial` |
-//! | `cli` | no | The `rolcb-hub` binary | `hub`, `clap` |
+//! | `log` | no | Hub connection, disconnection and lag messages through the [`log`](https://docs.rs/log) crate. Without it the library never prints anything. | `log` |
+//! | `cli` | no | The `rolcb-hub` binary (multi-threaded tokio runtime, Ctrl-C handling, logs to stderr) | `hub`, `log`, `clap` |
+//!
+//! # Examples and tools
+//!
+//! * `examples/gc_dump.rs` decodes a GridConnect capture (a JMRI monitor
+//!   log, `rolcb-hub -v` output, or `cat /dev/ttyACM0`) into readable
+//!   messages: `cargo run --example gc_dump -- capture.txt`.
+//! * `rolcb-hub` (`src/bin/rolcb-hub.rs`, feature `cli`) is a standalone
+//!   GridConnect hub: `cargo install rolcb --features cli,serial`. See the
+//!   [hub chapter](guide::hub).
+//! * `tests/throttle_session.rs` drives a throttle against a scripted train
+//!   end to end, and the [throttle chapter](guide::throttle) does the same
+//!   as a doctest.
 //!
 //! # Quick example
 //!
@@ -119,6 +132,14 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
+#![deny(rustdoc::broken_intra_doc_links)]
+#![warn(
+    rustdoc::missing_crate_level_docs,
+    rustdoc::bare_urls,
+    rustdoc::invalid_html_tags,
+    rustdoc::private_intra_doc_links
+)]
+#![warn(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
 extern crate alloc;
 
@@ -128,7 +149,6 @@ pub mod event;
 pub mod float16;
 pub mod gridconnect;
 #[cfg(feature = "hub")]
-#[cfg_attr(docsrs, doc(cfg(feature = "hub")))]
 pub mod hub;
 pub mod message;
 pub mod mti;
@@ -183,18 +203,22 @@ pub mod guide {
 
 pub use can::{CanFrame, CanHeader};
 pub use event::{EventId, EventState};
-pub use message::{Message, Received};
+pub use message::{EncodeError, Message, Received};
 pub use mti::Mti;
 pub use node::{Node, NodeInfo};
 pub use node_id::NodeId;
 
 /// Error returned when parsing textual or binary protocol data fails.
 ///
-/// Returned by the `FromStr` impls of [`NodeId`] and [`EventId`], by
-/// [`gridconnect::parse`], and by [`CanFrame::new`]. Most decoders in this
-/// crate are deliberately lenient and never fail (see
-/// [`Message::from_parts`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Returned by the `FromStr` impls of [`NodeId`], [`EventId`] and
+/// [`CanFrame`], by [`gridconnect::parse`], by [`CanFrame::new`] and by the
+/// `TryFrom<u64>` impl of [`NodeId`]. Most decoders in this crate are
+/// deliberately lenient and never fail (see [`Message::from_parts`]).
+///
+/// Implements `core::error::Error` (and therefore `std::error::Error`)
+/// with or without the `std` feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ParseError {
     /// Input was not in the expected format. The string says what was wrong.
     Format(&'static str),
@@ -214,9 +238,7 @@ impl core::fmt::Display for ParseError {
     }
 }
 
-#[cfg(feature = "std")]
-#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-impl std::error::Error for ParseError {}
+impl core::error::Error for ParseError {}
 
 pub(crate) fn hex_val(c: u8) -> Result<u8, ParseError> {
     match c {
@@ -228,17 +250,25 @@ pub(crate) fn hex_val(c: u8) -> Result<u8, ParseError> {
 }
 
 /// Parse "05.01.01.01.22.00" style dotted hex (dots optional) into `N` bytes.
+///
+/// Separators may be `.`, `:`, `-` or space. Exactly `2 * N` hex digits are
+/// required. Does not allocate.
 pub(crate) fn parse_dotted<const N: usize>(s: &str) -> Result<[u8; N], ParseError> {
-    let digits: alloc::vec::Vec<u8> = s
-        .bytes()
-        .filter(|c| !matches!(c, b'.' | b':' | b'-' | b' '))
-        .collect();
-    if digits.len() != N * 2 {
-        return Err(ParseError::Length);
-    }
     let mut out = [0u8; N];
-    for (i, pair) in digits.chunks(2).enumerate() {
-        out[i] = (hex_val(pair[0])? << 4) | hex_val(pair[1])?;
+    let mut n = 0usize;
+    for c in s.bytes() {
+        if matches!(c, b'.' | b':' | b'-' | b' ') {
+            continue;
+        }
+        let v = hex_val(c)?;
+        let Some(slot) = out.get_mut(n / 2) else {
+            return Err(ParseError::Length);
+        };
+        *slot = (*slot << 4) | v;
+        n += 1;
+    }
+    if n != N * 2 {
+        return Err(ParseError::Length);
     }
     Ok(out)
 }
@@ -251,4 +281,67 @@ pub(crate) fn fmt_dotted(bytes: &[u8], f: &mut core::fmt::Formatter<'_>) -> core
         write!(f, "{b:02X}")?;
     }
     Ok(())
+}
+
+/// Compiles the Rust example in `README.md` as a doctest.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every Cargo feature must be listed in the feature table of the crate docs.
+    #[test]
+    fn feature_table_lists_every_feature() {
+        let manifest = include_str!("../Cargo.toml");
+        let lib = include_str!("lib.rs");
+        let mut in_features = false;
+        let mut seen = 0;
+        for line in manifest.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                in_features = line == "[features]";
+                continue;
+            }
+            if !in_features || line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, _)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            if key == "default" {
+                continue;
+            }
+            seen += 1;
+            let row = alloc::format!("//! | `{key}` |");
+            assert!(
+                lib.contains(&row),
+                "feature `{key}` missing from the lib.rs feature table"
+            );
+        }
+        assert!(seen >= 6, "parsed only {seen} features");
+    }
+
+    #[test]
+    fn dotted_parsing() {
+        assert_eq!(parse_dotted::<2>("0A.bC"), Ok([0x0A, 0xBC]));
+        assert_eq!(parse_dotted::<2>("0abc"), Ok([0x0A, 0xBC]));
+        assert_eq!(parse_dotted::<2>("0a-b c"), Ok([0x0A, 0xBC]));
+        assert_eq!(parse_dotted::<2>("0abcd"), Err(ParseError::Length));
+        assert_eq!(parse_dotted::<2>("0abg"), Err(ParseError::Hex));
+        assert_eq!(parse_dotted::<2>(""), Err(ParseError::Length));
+    }
+
+    #[test]
+    fn parse_error_is_an_error() {
+        fn takes(_: &dyn core::error::Error) {}
+        takes(&ParseError::Hex);
+        let e = ParseError::Format("x");
+        let copy = e;
+        assert_eq!(e, copy);
+        assert_eq!(alloc::string::ToString::to_string(&e), "format error: x");
+    }
 }

@@ -132,11 +132,13 @@ impl Mti {
     /// This is bit 3 (`0x0008`) of the MTI. On CAN, addressed messages put
     /// the 12-bit destination alias in the first two data bytes; see
     /// [`Message::to_frames`](crate::Message::to_frames).
+    #[must_use]
     pub const fn is_addressed(self) -> bool {
         self.0 & 0x0008 != 0
     }
 
     /// True if the message carries an Event ID (bit 2, `0x0004`).
+    #[must_use]
     pub const fn has_event(self) -> bool {
         self.0 & 0x0004 != 0
     }
@@ -145,12 +147,16 @@ impl Mti {
     ///
     /// This is simply the low 12 bits. It is only meaningful for MTIs sent
     /// in global/addressed frames (frame type 1); [`Mti::DATAGRAM`] uses
-    /// datagram frame types instead.
+    /// datagram frame types instead. MTIs with bit 12 set do not fit; see
+    /// [`Message::try_to_frames`](crate::Message::try_to_frames).
+    #[must_use]
     pub const fn can_mti(self) -> u16 {
         self.0 & 0x0FFF
     }
 
-    /// A short human readable name, for logging.
+    /// A short human readable name, for logging (`"Unknown"` for MTIs
+    /// without a constant). `Display` prints the name and the hex value.
+    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             Mti::INITIALIZATION_COMPLETE => "InitComplete",
@@ -190,8 +196,20 @@ impl Mti {
 
     /// Map a 12-bit CAN-MTI back to the full MTI. All MTIs that are sent in
     /// CAN "global/addressed" frames fit in 12 bits, so this is the identity.
+    #[must_use]
     pub const fn from_can_mti(v: u16) -> Mti {
         Mti(v & 0x0FFF)
+    }
+}
+
+impl core::fmt::Display for Mti {
+    /// `PCER (0x05B4)`, or `Unknown (0x0DA8)` for MTIs without a constant.
+    ///
+    /// ```
+    /// assert_eq!(rolcb::Mti::PCER.to_string(), "PCER (0x05B4)");
+    /// ```
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{} (0x{:04X})", self.name(), self.0)
     }
 }
 
@@ -200,22 +218,39 @@ impl Mti {
 /// Codes are 16 bits. The top nibble classifies the error: `0x1xxx` is
 /// *permanent* (do not retry the same request), `0x2xxx` is *temporary*
 /// (the request may succeed if retried later). Lower bits refine the
-/// reason. Only the codes this crate uses are named here; see the *Message
-/// Network Standard* for the full list.
+/// reason. Only the codes this crate uses or that applications commonly
+/// need are named here; see the *Message Network Standard* for the full
+/// list and the [reference table](crate::guide::reference#error-codes).
 pub mod error_code {
     /// Permanent error, no further detail.
     pub const PERMANENT: u16 = 0x1000;
-    /// Permanent: the requested protocol or MTI is not implemented. Sent by
-    /// [`Node`](crate::Node) for addressed messages it does not support.
+    /// Permanent: source not permitted (the sender may not make this
+    /// request, e.g. it is not the train's controller).
+    pub const SOURCE_NOT_PERMITTED: u16 = 0x1020;
+    /// Permanent: not implemented, no further detail.
     pub const NOT_IMPLEMENTED: u16 = 0x1040;
     /// Permanent: the sub-command is not known.
     pub const NOT_IMPLEMENTED_SUBCOMMAND: u16 = 0x1041;
     /// Permanent: the command is not known.
     pub const NOT_IMPLEMENTED_COMMAND: u16 = 0x1042;
+    /// Permanent: the MTI or transport protocol is not implemented. Sent by
+    /// [`Node`](crate::Node) for addressed messages it does not support,
+    /// for Traction Control Commands to a node that is not a train, and in
+    /// Datagram Rejected when it has no datagram support.
+    pub const NOT_IMPLEMENTED_UNKNOWN_MTI: u16 = 0x1043;
     /// Temporary error, no further detail; retrying may succeed.
     pub const TEMPORARY: u16 = 0x2000;
+    /// Temporary: timed out waiting for the rest of a multi-frame message
+    /// or for a reply.
+    pub const TIMEOUT: u16 = 0x2010;
     /// Temporary: the receiver has no buffer available right now.
     pub const BUFFER_UNAVAILABLE: u16 = 0x2020;
     /// Temporary: frames arrived out of order (multi-frame reassembly failed).
     pub const OUT_OF_ORDER: u16 = 0x2040;
+    /// Temporary, out of order: a middle or final frame arrived without a
+    /// first frame.
+    pub const OUT_OF_ORDER_NO_START: u16 = 0x2041;
+    /// Temporary, out of order: a first frame arrived before the previous
+    /// message from the same source had ended.
+    pub const OUT_OF_ORDER_START_BEFORE_END: u16 = 0x2042;
 }

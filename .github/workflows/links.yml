@@ -1,0 +1,28 @@
+name: links
+
+# Weekly check of external links in the README and guide chapters. Not a PR
+# gate: link rot is reported, but never blocks a merge.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lychee:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check links
+        uses: lycheeverse/lychee-action@v2
+        with:
+          # `crate::…` targets are rustdoc intra-doc links, not files; the
+          # crate is not on docs.rs until its first release.
+          args: >-
+            --no-progress
+            --exclude 'crate::'
+            --exclude '^https://docs\.rs/rolcb'
+            README.md docs/*.md
+          fail: true

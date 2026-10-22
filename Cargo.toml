@@ -7,32 +7,48 @@ license = "MIT"
 readme = "README.md"
 keywords = ["openlcb", "lcc", "model-railroad", "can", "gridconnect"]
 categories = ["embedded", "network-programming", "no-std"]
-documentation = "https://docs.rs/rolcb"
+repository = "https://github.com/UncommonModels/rolcb"
+homepage = "https://www.uncommonmodels.com/rolcb/"
+# Same page as `homepage`; spelled with index.html so nightly cargo's
+# `redundant_homepage` lint stays quiet.
+documentation = "https://www.uncommonmodels.com/rolcb/index.html"
+# `u32::is_multiple_of` and `core::error::Error` need 1.87 / 1.81.
+rust-version = "1.87"
+exclude = [".github", "scripts"]
 
 [package.metadata.docs.rs]
 # Document every feature (hub, serial, cli, serde) and show "Available on
 # crate feature X only" badges via `doc(cfg)`.
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [features]
 default = ["std"]
 std = []
 serde = ["dep:serde"]
-# Async GridConnect hub (TCP + WebSocket + uplinks) and the `rolcb-hub` binary.
-hub = ["std", "dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
+# Async GridConnect hub library module (TCP + uplinks). The `rolcb-hub`
+# binary additionally needs `cli`.
+hub = ["std", "dep:tokio"]
 # Serial-port uplink for the hub (USB GridConnect adapters).
 serial = ["hub", "dep:tokio-serial"]
-# Command-line parsing for the `rolcb-hub` binary.
-cli = ["hub", "dep:clap"]
+# Route the hub's connection/lag messages through the `log` crate. Without it
+# the library is silent.
+log = ["dep:log"]
+# The `rolcb-hub` binary: command-line parsing, a multi-threaded runtime,
+# Ctrl-C handling, and log output to stderr.
+cli = ["hub", "log", "dep:clap", "tokio/rt-multi-thread", "tokio/macros", "tokio/signal"]
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
-tokio = { version = "1.54", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time", "signal"], optional = true }
-tokio-tungstenite = { version = "0.30", optional = true }
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
+tokio = { version = "1.54", features = ["net", "io-util", "rt", "sync", "time"], optional = true }
 tokio-serial = { version = "5.5", default-features = false, optional = true }
 clap = { version = "4.6", features = ["derive"], optional = true }
+log = { version = "0.4", default-features = false, optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.54", features = ["net", "io-util", "rt", "rt-multi-thread", "macros", "sync", "time"] }
+serde_json = "1"
 
 [[bin]]
 name = "rolcb-hub"

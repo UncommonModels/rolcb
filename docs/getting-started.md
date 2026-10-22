@@ -9,8 +9,10 @@ nothing but the crate and a byte buffer standing in for the wire.
 [dependencies]
 rolcb = "0.1"
 
-# Or, for the async hub and the rolcb-hub binary:
+# Or, for the async hub library module:
 # rolcb = { version = "0.1", features = ["hub"] }
+# The rolcb-hub binary needs the `cli` feature:
+#   cargo install rolcb --features cli,serial
 
 # In a WASM or embedded build:
 # rolcb = { version = "0.1", default-features = false }
@@ -123,8 +125,8 @@ You need a way to put frames on the bus:
 * **A GridConnect TCP hub** such as JMRI's OpenLCB hub or this crate's
   `rolcb-hub` (port 12021). Open a TCP socket and exchange GridConnect
   lines.
-* **A browser.** Run `rolcb-hub` and connect with a WebSocket to port
-  12022; see [`no_std` and WASM](crate::guide::no_std).
+* **A browser.** Talk to a USB-CAN adapter directly over Web Serial from
+  WASM; see [`no_std` and WASM](crate::guide::no_std).
 
 The [architecture chapter](crate::guide::architecture) shows complete loops for
 blocking sockets and for tokio, and the [hub chapter](crate::guide::hub) covers

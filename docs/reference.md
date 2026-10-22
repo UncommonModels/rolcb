@@ -169,13 +169,17 @@ big-endian.
 | `20 01 FF NN NN NN NN NN NN` | Assign Controller (flags, Node ID) | `AssignController` |
 | `20 02 FF NN NN NN NN NN NN` | Release Controller | `ReleaseController` |
 | `20 03` | Query Controller | `QueryController` |
+| `20 04 FF NN NN NN NN NN NN` | Controller Changing Notify (flags, new controller's Node ID); sent **by the train to its current controller** | `ControllerChangingNotify` |
 | `30 …` | Consist (listener) configuration | `Unknown` |
 | `40 01` | Management: Reserve | `Reserve` |
 | `40 02` | Management: Release | `Release` |
 | `40 03` | Management: No-op / heartbeat answer | `Noop` |
 
 Bit 7 of byte 0 (`80`, `LISTENER_FLAG`) marks a command forwarded to a
-consist member; decoding ignores it.
+consist member; decoding ignores it. A [`Node`](crate::Node) without the
+`TRACTION_CONTROL` protocol bit rejects incoming commands with
+Optional Interaction Rejected `1043`, except Controller Changing Notify
+(`20 04`), which throttles must receive.
 
 ## Traction Control replies
 
@@ -187,7 +191,7 @@ Payload of MTI `01E9`; see [`traction::Reply`](crate::traction::Reply).
 | `11 AA AA AA VV VV` | Query Function | `QueryFunction` |
 | `20 01 RR` | Assign Controller result (0 = OK) | `AssignController` |
 | `20 03 FF NN NN NN NN NN NN` | Query Controller (flags, controller Node ID) | `QueryController` |
-| `20 04 RR` | Controller Changed notify | `ControllerChanged` |
+| `20 04 RR` | Controller Changing reply, **sent by the current controller to the train** (0 = handover accepted) | `ControllerChanged` |
 | `40 01 RR` | Reserve result | `Reserve` |
 | `40 03 TT` | Heartbeat request, timeout `TT` seconds | `Heartbeat` |
 
@@ -251,12 +255,17 @@ Rejected; see [`mti::error_code`](crate::mti::error_code).
 | Code | Class | Meaning | Constant |
 |---|---|---|---|
 | `1000` | permanent | permanent error | `PERMANENT` |
+| `1020` | permanent | source not permitted | `SOURCE_NOT_PERMITTED` |
 | `1040` | permanent | not implemented | `NOT_IMPLEMENTED` |
 | `1041` | permanent | not implemented: unknown sub-command | `NOT_IMPLEMENTED_SUBCOMMAND` |
 | `1042` | permanent | not implemented: unknown command | `NOT_IMPLEMENTED_COMMAND` |
+| `1043` | permanent | not implemented: unknown MTI or transport protocol. Sent by [`Node`](crate::Node) for unknown addressed MTIs, traction commands to a non-train, and datagrams | `NOT_IMPLEMENTED_UNKNOWN_MTI` |
 | `2000` | temporary | temporary error, retry later | `TEMPORARY` |
+| `2010` | temporary | timeout | `TIMEOUT` |
 | `2020` | temporary | buffer unavailable | `BUFFER_UNAVAILABLE` |
 | `2040` | temporary | out of order | `OUT_OF_ORDER` |
+| `2041` | temporary | out of order: middle or final frame without a first frame | `OUT_OF_ORDER_NO_START` |
+| `2042` | temporary | out of order: first frame before the previous message ended | `OUT_OF_ORDER_START_BEFORE_END` |
 
 ## Well-known events
 
@@ -266,6 +275,7 @@ Rejected; see [`mti::error_code`](crate::mti::error_code).
 | `01.00.00.00.00.00.FF.FE` | Clear Emergency Off | `EventId::CLEAR_EMERGENCY_OFF` |
 | `01.00.00.00.00.00.FF.FD` | Emergency Stop of all operations | `EventId::EMERGENCY_STOP` |
 | `01.00.00.00.00.00.FF.FC` | Clear Emergency Stop | `EventId::CLEAR_EMERGENCY_STOP` |
+| `01.01.00.00.00.00.02.01` | Duplicate Node ID detected (produced once by [`Node`](crate::Node)) | `EventId::DUPLICATE_NODE_ID` |
 | `01.01.00.00.00.00.03.03` | Is Train (produced by train nodes) | `EventId::IS_TRAIN` |
 
 ## Timing and limits
@@ -273,11 +283,12 @@ Rejected; see [`mti::error_code`](crate::mti::error_code).
 | Item | Value |
 |---|---|
 | CID → RID wait | 200 ms ([`ALIAS_RESERVE_MS`](crate::node::ALIAS_RESERVE_MS)) |
-| Messages held before login | 512 |
-| Partial multi-frame messages tracked | 32 |
+| Messages held before login | 512 ([`MAX_PENDING`](crate::node::MAX_PENDING)) |
+| Partial multi-frame messages tracked | 32 (oldest evicted first) |
+| Partial message expiry (`accept_at`, used by `Node`) | 3 s without a new frame ([`PARTIAL_TIMEOUT_MS`](crate::message::PARTIAL_TIMEOUT_MS)) |
 | Maximum reassembled payload | 256 bytes |
 | Datagram maximum (standard) | 72 bytes |
 | GridConnect decoder token limit | 32 characters |
-| Hub per-port queue | 4096 frames |
+| Hub broadcast ring (shared by all ports) | 4096 frames |
 | Hub write batch | 64 frames |
 | Hub reconnect delay | 2 s |
