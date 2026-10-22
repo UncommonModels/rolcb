@@ -1,4 +1,4 @@
-# ROLCB
+# rolcb
 Rustified OpenLCB library.
 
 `rolcb` is a sans-IO implementation of the [OpenLCB / LCC](https://openlcb.org) protocol stack for model railroads. You feed it CAN frames and the time. It gives back frames to send and decoded messages. Because of that it works the same from tokio, from WASM in a browser, or from `no_std` embedded code.
@@ -7,7 +7,7 @@ It also includes **`rolcb-hub`**, a standalone GridConnect hub. It relays traffi
 
 ## Documentation
 
-**API docs and guide: <https://uncommonmodels.github.io/ROLCB/>** (built from `main` by [`.github/workflows/docs.yml`](.github/workflows/docs.yml); also on [docs.rs](https://docs.rs/rolcb) once published).
+**API docs and guide: <https://www.uncommonmodels.com/rolcb/>** (built from `main` by [`.github/workflows/docs.yml`](.github/workflows/docs.yml); also on [docs.rs](https://docs.rs/rolcb) once published).
 
 Besides the API reference, the docs include guide chapters (sources in [`docs/`](docs/), and every Rust example in them runs as a doctest):
 
