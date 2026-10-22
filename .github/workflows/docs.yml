@@ -1,0 +1,72 @@
+name: docs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one Pages deployment at a time; don't cancel one that is in progress.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Nightly for `--cfg docsrs` / `doc_cfg`, so feature badges render like docs.rs.
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies (libudev for the serial feature)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+
+      - name: Run doctests (guide examples included)
+        run: cargo test --doc --all-features
+
+      - name: Build docs
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings -D rustdoc::broken_intra_doc_links
+        run: cargo doc --no-deps --all-features
+
+      - name: Add root redirect
+        run: |
+          cat > target/doc/index.html <<'HTML'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <title>rolcb documentation</title>
+          <meta http-equiv="refresh" content="0; url=rolcb/index.html">
+          <link rel="canonical" href="rolcb/index.html">
+          </head>
+          <body><p>Redirecting to <a href="rolcb/index.html">rolcb/index.html</a>…</p></body>
+          </html>
+          HTML
+          touch target/doc/.nojekyll
+          # upload-pages-artifact rejects symlinks and the cargo lock file.
+          rm -f target/doc/.lock
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

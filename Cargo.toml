@@ -1,0 +1,47 @@
+[package]
+name = "rolcb"
+version = "0.1.0"
+edition = "2021"
+description = "Rustified OpenLCB: a sans-IO OpenLCB/LCC protocol library (CAN, GridConnect, events, traction)"
+license = "MIT"
+readme = "README.md"
+keywords = ["openlcb", "lcc", "model-railroad", "can", "gridconnect"]
+categories = ["embedded", "network-programming", "no-std"]
+documentation = "https://docs.rs/rolcb"
+
+[package.metadata.docs.rs]
+# Document every feature (hub, serial, cli, serde) and show "Available on
+# crate feature X only" badges via `doc(cfg)`.
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["std"]
+std = []
+serde = ["dep:serde"]
+# Async GridConnect hub (TCP + WebSocket + uplinks) and the `rolcb-hub` binary.
+hub = ["std", "dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
+# Serial-port uplink for the hub (USB GridConnect adapters).
+serial = ["hub", "dep:tokio-serial"]
+# Command-line parsing for the `rolcb-hub` binary.
+cli = ["hub", "dep:clap"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
+tokio = { version = "1.54", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time", "signal"], optional = true }
+tokio-tungstenite = { version = "0.30", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
+tokio-serial = { version = "5.5", default-features = false, optional = true }
+clap = { version = "4.6", features = ["derive"], optional = true }
+
+[[bin]]
+name = "rolcb-hub"
+required-features = ["cli"]
+
+[[test]]
+name = "hub"
+required-features = ["hub"]
+
+[[example]]
+name = "gc_dump"
+required-features = ["std"]
