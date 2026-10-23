@@ -1,0 +1,48 @@
+# Nightly testing release: every day at 5am US Eastern, if main changed since
+# the last nightly, rebuild rolcb-hub for every platform and replace the
+# `nightly` pre-release. Run it by hand to publish a nightly immediately.
+name: nightly
+
+on:
+  schedule:
+    # GitHub cron is UTC-only: 09:00 UTC is 5am EDT, 10:00 UTC is 5am EST.
+    # The gate below keeps whichever one matches New York's offset today.
+    - cron: "0 9 * * *"
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency: { group: nightly, cancel-in-progress: true }
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run=true
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            offset=$(TZ=America/New_York date +%z)   # -0400 (EDT) or -0500 (EST)
+            case "${{ github.event.schedule }}/$offset" in
+              "0 9 * * */-0400"|"0 10 * * */-0500") ;;
+              *) run=false; echo "not 5am Eastern for this trigger" ;;
+            esac
+            last=$(gh api "repos/${{ github.repository }}/git/ref/tags/nightly" -q .object.sha 2>/dev/null || true)
+            if [ "$last" = "${{ github.sha }}" ]; then run=false; echo "no changes since the last nightly"; fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      channel: nightly
+    permissions:
+      contents: write

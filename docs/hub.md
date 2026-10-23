@@ -55,6 +55,8 @@ tar xzf rolcb-hub-*-aarch64-unknown-linux-musl.tar.gz
 ./rolcb-hub-*/rolcb-hub --serial /dev/ttyACM0
 ```
 
+A [`nightly` pre-release](https://github.com/UncommonModels/rolcb/releases/tag/nightly) with the same files is rebuilt from `main` every day at 5am US Eastern when anything changed; use it to try fixes before they're released.
+
 On macOS, clear the download quarantine first: `xattr -d com.apple.quarantine rolcb-hub`. `SHA256SUMS` lists the checksums.
 
 Or build it yourself (the binary is part of the `rolcb` crate, behind the `cli` feature):

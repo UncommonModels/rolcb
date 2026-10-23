@@ -83,7 +83,7 @@ Cargo features:
 
 ## rolcb-hub
 
-Download a prebuilt `rolcb-hub` for Linux (x86_64, Raspberry Pi 32/64-bit), macOS or Windows from the [releases page](https://github.com/UncommonModels/rolcb/releases), or build it yourself. It's part of this crate, behind the `cli` feature:
+Download a prebuilt `rolcb-hub` for Linux (x86_64, Raspberry Pi 32/64-bit), macOS or Windows from the [releases page](https://github.com/UncommonModels/rolcb/releases) (daily testing builds of `main` are on the [`nightly` pre-release](https://github.com/UncommonModels/rolcb/releases/tag/nightly)), or build it yourself. It's part of this crate, behind the `cli` feature:
 
 ```sh
 cargo install --path . --features cli,serial

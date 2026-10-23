@@ -1,15 +1,23 @@
 # Prebuilt `rolcb-hub` binaries.
 #
-# Pushing a tag like `v0.2.0` builds the hub for each platform below and
-# attaches the archives (plus SHA256SUMS) to a GitHub release for that tag.
-# Running the workflow by hand builds the same archives as workflow artifacts
-# without publishing anything, which is handy for testing.
+# - Pushing a tag like `v0.2.0` builds the hub for each platform below and
+#   attaches the archives (plus SHA256SUMS) to a GitHub release for that tag.
+# - nightly.yml calls this with `channel: nightly` to replace the `nightly`
+#   pre-release with a fresh build of main.
+# - Running it by hand builds the same archives as workflow artifacts without
+#   publishing anything (a dry run).
 name: release
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      channel:
+        description: "release (tags), nightly, or dev (dry run)"
+        type: string
+        default: dev
 
 permissions:
   contents: write
@@ -53,7 +61,9 @@ jobs:
         id: package
         shell: bash
         run: |
-          if [ "${{ github.ref_type }}" = "tag" ]; then
+          if [ "${{ inputs.channel }}" = "nightly" ]; then
+            version="nightly-$(date -u +%Y%m%d)"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
             version="${{ github.ref_name }}"
           else
             version="dev-${GITHUB_SHA::7}"
@@ -79,7 +89,7 @@ jobs:
 
   publish:
     needs: build
-    if: github.ref_type == 'tag'
+    if: github.ref_type == 'tag' || inputs.channel == 'nightly'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -91,7 +101,19 @@ jobs:
         working-directory: dist
         run: sha256sum * > SHA256SUMS && cat SHA256SUMS
 
+      - name: Publish nightly pre-release
+        if: inputs.channel == 'nightly'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete nightly --cleanup-tag --yes || true
+          gh release create nightly dist/* --prerelease --target "$GITHUB_SHA" \
+            --title "Nightly $(date -u +%Y-%m-%d)" \
+            --notes "Automated testing build of \`${GITHUB_SHA::7}\` from $(date -u '+%Y-%m-%d %H:%M UTC'). Untested: use a numbered release for anything that matters."
+
       - name: Publish release
+        if: github.ref_type == 'tag' && inputs.channel != 'nightly'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
